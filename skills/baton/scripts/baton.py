@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baton: Claude (conductor / judge) drives Codex CLI (executor).
+"""Baton: Claude (conductor / monitor) drives Codex CLI (executor).
 
 Every Codex run is a "leg": `codex exec` (first leg) or `codex exec resume <thread>` (later legs).
 A leg ends when the executor finishes, asks for a decision, hands in a major-change report,
@@ -10,6 +10,7 @@ State lives in <project>/.baton/ (see README). Python 3.9+, stdlib only.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -35,17 +36,37 @@ sys.path.insert(0, HERE)
 import codex_quota  # noqa: E402
 import statusline as baton_statusline  # noqa: E402
 
-EXCLUDE = [":(exclude).baton", ":(exclude).council"]
+# Baton's own records never count as code: not at the top, and not in a nested project either.
+EXCLUDE = [":(exclude,glob)**/.baton/**", ":(exclude,glob)**/.council/**"]
+# Default info/exclude of the shadow repo, written once when the repo is created (decision D001):
+# data/ and models/ are often code packages (src/models/), so only the top-level ones are
+# excluded; outputs/, logs/ and checkpoints/ are excluded at any depth.
+SHADOW_EXCLUDE_MARK = "# Baton shadow-repo excludes"
+SHADOW_EXCLUDE_DEFAULTS = [
+    "**/.baton/runs/", "**/.baton/rollback-backup/", "**/.claude/settings.local.json",
+    ".venv*/", "venv/", "node_modules/", "__pycache__/", "*.pyc", ".DS_Store",
+    "/data/", "/models/", "outputs/", "logs/", "checkpoints/",
+]
+# Directory names worth showing at init wherever they occur, so the user can confirm them.
+BULKY_DIR_NAMES = {"data", "models", "outputs", "logs", "checkpoints"}
+# Every variable `git rev-parse --local-env-vars` lists: none may leak into shadow-repo calls.
+GIT_LOCAL_ENV_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+    "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+)
 TASK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
-BATON_GITIGNORE = ["runs/", "*.lock", "statusline-saved.json", "tasks/*/state.json", "rollback-backup/"]
+BATON_GITIGNORE = ["runs/", "*.lock", "statusline-saved.json", "tasks/*/state.json", "rollback-backup/", "project-id"]
 LEG_END_EVENTS = {
     "done": "DONE", "decision": "DECISION", "report": "REPORT", "blocked": "BLOCKED",
     "failed": "FAILED", "stopped": "STOPPED", "paused_unsupervised": "PAUSED_UNSUPERVISED",
 }
 NEXT_STEP = {
     "DONE": "按 references/review.md 做最终验收（diff + 测试），再向用户汇报；不要自行提交。",
-    "DECISION": "读决策请求文件，按 references/decision.md 决策（按 judge.council_for_major_decisions 决定是否用 council），然后 baton resume。",
+    "DECISION": "读决策请求文件，按 references/decision.md 决策（按 conductor.council_for_major_decisions 决定是否用 council），然后 baton resume。",
     "REPORT": "按 references/review.md 审阅汇报 HTML，写 .baton/reviews/ 审阅意见，然后 baton resume。",
     "BLOCKED": "看 summary 里缺什么；能解决就解决后 baton resume，涉及权限/网络/费用先问用户。",
     "FAILED": "看错误和 stderr 末尾判断原因（额度、网络、参数）；修正后 baton resume 重试本轮。",
@@ -172,7 +193,21 @@ class ConfigError(Exception):
     """A project configuration error that should be shown to the caller."""
 
 
-JUDGE_MODELS = {"opus", "sonnet", "haiku", "fable"}
+CONDUCTOR_MODELS = {"opus", "sonnet", "haiku", "fable"}
+MODES = {"standard", "lean"}
+
+
+def lean_overrides():
+    return {
+        "conductor": {"reasoning_effort": "medium"},
+        "executor": {
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "medium",
+            "escalation": {"enabled": False},
+        },
+        "monitor": {"enabled": False},
+        "supervision": {"max_unsupervised_minutes": 0, "interval_minutes": 0},
+    }
 
 
 def run(cmd, cwd=None, env=None, check=True, input_text=None):
@@ -193,12 +228,14 @@ def safe_quota(block=True, notify=False):
 
 def is_git(root):
     p = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=clean_git_env())
     return p.returncode == 0 and p.stdout.strip() == "true"
 
 
 def git(root, *args, env=None, check=True, input_text=None):
-    return run(["git", "-C", root, *args], env=env, check=check, input_text=input_text)
+    """git in the user's own repository (statusline helpers and v1 tasks)."""
+    return run(["git", "-C", root, *args], env=env if env is not None else clean_git_env(),
+               check=check, input_text=input_text)
 
 
 def git_top(root):
@@ -219,10 +256,11 @@ def snapshot(root, message):
         if real_index and not os.path.isabs(real_index):
             real_index = os.path.join(top, real_index)
         if real_index and os.path.exists(real_index):
-            shutil.copyfile(real_index, tmp_index)  # keeps the stat cache: fast add
+            # copy2 keeps the index mtime, so git's racy-clean check still catches same-second edits
+            shutil.copy2(real_index, tmp_index)  # keeps the stat cache: fast add
         else:
             os.remove(tmp_index)
-        env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
+        env = clean_git_env({"GIT_INDEX_FILE": tmp_index})
         env.setdefault("GIT_AUTHOR_NAME", "Baton")
         env.setdefault("GIT_AUTHOR_EMAIL", "baton@localhost")
         env.setdefault("GIT_COMMITTER_NAME", "Baton")
@@ -262,32 +300,250 @@ def snapshot(root, message):
             os.remove(tmp_index)
 
 
-def store_ref(root, task, label, commit):
+def _git_author_env(env):
+    env.setdefault("GIT_AUTHOR_NAME", "Baton")
+    env.setdefault("GIT_AUTHOR_EMAIL", "baton@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", "Baton")
+    env.setdefault("GIT_COMMITTER_EMAIL", "baton@localhost")
+    return env
+
+
+def clean_git_env(extra=None):
+    """os.environ without any variable that redirects git to another repository."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_LOCAL_ENV_VARS}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _locked(path):
+    """Open path for an exclusive flock; use as a context manager."""
+    f = open(path, "w")
+    if fcntl:
+        fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def _probe_ignorecase(directory):
+    """True if the file system holding directory ignores letter case; None if it cannot tell."""
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".baton-case-probe-", dir=directory)
+        os.close(fd)
+    except OSError:
+        return None
+    try:
+        return os.path.exists(os.path.join(directory, os.path.basename(probe).upper()))
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+
+def validate_external_state(project):
+    real_state, real_root = os.path.realpath(project.state_dir), os.path.realpath(project.root)
+    if real_state == real_root or real_state.startswith(real_root + os.sep):
+        raise RuntimeError(f"项目外状态目录 {project.state_dir} 落在项目目录里，快照会把自己也存进去；"
+                           "请把 BATON_HOME 设到项目之外")
+
+
+def ensure_shadow(project):
+    """Create the project's private snapshot repo once.
+
+    The repo is built in a temporary directory under snap.lock and renamed into place, so
+    concurrent first snapshots never see a half-made repo.  Its default excludes are written
+    only here: later edits by the user are never undone.
+    """
+    validate_external_state(project)
+    gd = project.snap_git_dir
+    if os.path.isfile(os.path.join(gd, "HEAD")):
+        return gd
+    os.makedirs(project.state_dir, exist_ok=True)
+    with _locked(os.path.join(project.state_dir, "snap.lock")):
+        if os.path.isfile(os.path.join(gd, "HEAD")):
+            return gd
+        if os.path.isdir(gd):
+            os.rmdir(gd)  # a leftover empty dir; a non-empty one without HEAD raises here, on purpose
+        tmp = f"{gd}.tmp-{os.getpid()}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        env = clean_git_env()
+        run(["git", "init", "-q", "--bare", tmp], env=env)
+        # store working-tree bytes exactly: no end-of-line conversion or filters on the way in or out
+        run(["git", "--git-dir", tmp, "config", "core.autocrlf", "false"], env=env)
+        # git probed case sensitivity where snap.git lives; the project's own volume is what counts
+        probe_dir = project.dir if os.path.isdir(project.dir) else project.root
+        ignorecase = _probe_ignorecase(probe_dir) if os.path.isdir(probe_dir) else None
+        if ignorecase is not None:
+            run(["git", "--git-dir", tmp, "config", "core.ignorecase", "true" if ignorecase else "false"], env=env)
+        os.makedirs(os.path.join(tmp, "info"), exist_ok=True)
+        with open(os.path.join(tmp, "info", "attributes"), "w") as f:
+            f.write("* -text -filter -ident -working-tree-encoding\n")
+        exclude = os.path.join(tmp, "info", "exclude")
+        text = read_text(exclude)
+        with open(exclude, "a") as f:
+            f.write(("\n" if text and not text.endswith("\n") else "")
+                    + SHADOW_EXCLUDE_MARK + "\n" + "\n".join(SHADOW_EXCLUDE_DEFAULTS) + "\n")
+        os.rename(tmp, gd)
+    return gd
+
+
+class SnapStore:
+    """Where a task's checkpoints live.
+
+    "shadow" (v2): Baton's private repo in the project state dir.  Every git call runs with
+    GIT_DIR=<snap.git> and GIT_WORK_TREE=<project dir>, so the user's .git, index, HEAD and refs
+    are never touched, and ignore files above the project dir (such as a whitelist .gitignore
+    of an enclosing repo) do not apply.
+    "repo" (v1 tasks): the user's own repository, as Baton v1 used it.
+    """
+
+    def __init__(self, project, kind):
+        self.project, self.kind = project, kind
+        if kind == "shadow":
+            self.cwd = self.top = project.root
+            self.git_dir = project.snap_git_dir
+        else:
+            self.cwd = project.root
+            self.top = git_top(project.root)
+            self.git_dir = None
+
+    def env(self, extra=None):
+        env = clean_git_env()
+        if self.kind == "shadow":
+            env["GIT_DIR"] = self.git_dir
+            env["GIT_WORK_TREE"] = self.top
+        if extra:
+            env.update(extra)
+        return env
+
+    def git(self, *args, env=None, check=True, input_text=None, cwd=None):
+        return run(["git", "-C", cwd or self.cwd, *args], env=self.env(env), check=check, input_text=input_text)
+
+    def has_commit(self, rev):
+        if self.kind == "shadow" and not os.path.isdir(self.git_dir):
+            return False
+        return bool(self.git("rev-parse", "--verify", "-q", f"{rev}^{{commit}}", check=False).strip())
+
+    def user_tracked(self):
+        """Paths under the project that the user's own repository tracks (decision D002).
+
+        Read-only: `git ls-files` reads the user's index and writes nothing.  Empty when the
+        project is not inside a git repository.
+        """
+        p = subprocess.run(["git", "-C", self.project.root, "ls-files", "-z", "--", "."],
+                           env=clean_git_env(), capture_output=True, text=True)
+        return {x for x in p.stdout.split("\0") if x} if p.returncode == 0 else set()
+
+    def user_gitlinks(self):
+        p = subprocess.run(["git", "-C", self.project.root, "ls-files", "-s", "-z", "--", "."],
+                           env=clean_git_env(), capture_output=True, text=True)
+        links = set()
+        for item in p.stdout.split("\0"):
+            if item.startswith("160000 ") and "\t" in item:
+                links.add(item.split("\t", 1)[1])
+        return links
+
+    def snapshot(self, message):
+        """Commit object of the project dir; refs are not moved.
+
+        Covers every file that is not excluded, plus the files the user's repository tracks
+        even when an ignore rule matches them, as Baton v1 did.  Entries that an exclude added
+        after an earlier snapshot now matches leave the shadow index first, so editing the
+        exclude file takes effect for files that were already snapshotted.
+        """
+        if self.kind == "repo":
+            return snapshot(self.project.root, message)
+        ensure_shadow(self.project)
+        top = self.top
+        with _locked(os.path.join(self.project.state_dir, "snap.lock")):  # one shadow-index user at a time
+            env = _git_author_env(self.env())
+            stale_lock = os.path.join(self.git_dir, "index.lock")
+            if os.path.exists(stale_lock):
+                os.remove(stale_lock)  # every Baton writer holds snap.lock, so this one is left over
+            tracked = self.user_tracked()
+            now_ignored = [x for x in run(["git", "-C", top, "ls-files", "-z", "-ci", "--exclude-standard"],
+                                          env=env).split("\0") if x and x not in tracked]
+            if now_ignored:
+                run(["git", "-C", top, "update-index", "--force-remove", "-z", "--stdin"], env=env,
+                    input_text="".join(x + "\0" for x in now_ignored))
+            for attempt in range(5):
+                p = subprocess.run(["git", "-C", top, "add", "-A", "--ignore-errors"], env=env,
+                                   capture_output=True, text=True)
+                if p.returncode in (0, 1):  # 1: some files unreadable, the rest was added
+                    if p.returncode == 1:
+                        print(f"baton: 快照时有文件无法读取，已跳过：{p.stderr.strip()[:300]}", file=sys.stderr)
+                    break
+                time.sleep(0.3 * (attempt + 1))  # usually a file vanished mid-scan; try again
+            else:
+                raise RuntimeError(f"git add -A 失败：{p.stderr.strip()[:300]}")
+            if tracked:
+                have = set(run(["git", "-C", top, "ls-files", "-z"], env=env).split("\0"))
+                gitlinks = self.user_gitlinks()
+                forced = []
+                skipped = []
+                for path in sorted(tracked - have):
+                    if not os.path.lexists(os.path.join(top, path)):
+                        continue
+                    if _leading_symlink(top, path):
+                        skipped.append(f"{path}（路径经过符号链接）")
+                    elif _under(path, gitlinks):
+                        skipped.append(f"{path}（gitlink）")
+                    else:
+                        forced.append(path)
+                if skipped:
+                    print("baton: 强制加入时跳过：" + "，".join(skipped[:20]), file=sys.stderr)
+                if forced:
+                    add_cmd = ["git", "-C", top, "add", "-f", "--ignore-errors", "--pathspec-from-file=-",
+                               "--pathspec-file-nul"]
+                    forced_input = "".join(x + "\0" for x in forced)
+                    add = subprocess.run(add_cmd, env=dict(env, GIT_LITERAL_PATHSPECS="1"),
+                                         input=forced_input, capture_output=True, text=True)
+                    if add.returncode != 0:
+                        print("baton: 批量强制加入失败，逐个重试：" + add.stderr.strip()[:500], file=sys.stderr)
+                        for path in forced:
+                            one = subprocess.run(add_cmd, env=dict(env, GIT_LITERAL_PATHSPECS="1"),
+                                                 input=path + "\0", capture_output=True, text=True)
+                            if one.returncode != 0:
+                                print(f"baton: 强制加入失败 {path}：{one.stderr.strip()[:300]}", file=sys.stderr)
+            tree = run(["git", "-C", top, "write-tree"], env=env).strip()
+            return run(["git", "-C", top, "commit-tree", tree, "-m", message], env=env).strip()
+
+
+def store_ref(store, task, label, commit):
     ref, k = f"refs/baton/{task}/{label}", 1
-    while git(root, "rev-parse", "--verify", "-q", ref, check=False).strip():
+    while store.git("rev-parse", "--verify", "-q", ref, check=False).strip():
         k += 1  # never overwrite an existing checkpoint
         ref = f"refs/baton/{task}/{label}-{k}"
-    git(root, "update-ref", ref, commit)
+    store.git("update-ref", ref, commit)
     return ref
 
 
-def checkpoint(root, task, label):
-    if not is_git(root):
-        return None
-    return store_ref(root, task, label, snapshot(root, f"baton checkpoint {task}/{label} {stamp()}"))
+def checkpoint(store, task, label):
+    return store_ref(store, task, label, store.snapshot(f"baton checkpoint {task}/{label} {stamp()}"))
 
 
-def try_checkpoint(root, task, label):
+def try_checkpoint(project, task, label, st=None):
     """checkpoint() that reports instead of raising: (ref or None, error or None)."""
     try:
-        return checkpoint(root, task, label), None
+        if not project.task_exists(task):
+            return None, f"任务 {task} 不存在（没有简报或状态文件）"
+        if project.legacy_state_in_flight(task):
+            return None, "任务还有 Baton v1 的一轮在运行，请等这一轮结束"
+        store = project.store(task, st)
+        if store is None:
+            return None, "这个任务建立于 Baton v1，项目又不是 git 仓库，没有回滚点"
+        ref = checkpoint(store, task, label)
+        if store.kind == "shadow" and (project.read_state(task, {}) or {}).get("snapshot_store") != "shadow":
+            # from now on this task's refs live in the shadow repo, whatever the task looked like
+            project.update_state(task, lambda s: s.update(snapshot_store="shadow"))
+        return ref, None
     except Exception as e:  # noqa: BLE001 — a failed snapshot must not take the caller down
         return None, str(e)
 
 
-def shortstat(root, a, b):
+def shortstat(store, a, b):
     """(files, insertions, deletions) between two commits, excluding Baton's own dirs."""
-    out = git(root, "diff", "--shortstat", a, b, "--", ".", *EXCLUDE, check=False)
+    out = store.git("diff", "--shortstat", a, b, "--", ".", *code_excludes(store), check=False)
 
     def num(pattern):
         m = re.search(pattern, out)
@@ -295,13 +551,13 @@ def shortstat(root, a, b):
     return num(r"(\d+) files? changed"), num(r"(\d+) insertions?"), num(r"(\d+) deletions?")
 
 
-def diff_tree_entries(root, a, b):
-    """[(src_mode, dst_mode, status, top-relative path)] between two commits, under root.
+def diff_tree_entries(store, a, b):
+    """[(src_mode, dst_mode, status, top-relative path)] between two commits, under the project.
 
     Plumbing (diff-tree) so user diff.* settings such as diff.relative or diff.renames
     cannot change the paths we act on.
     """
-    raw = git(root, "diff-tree", "-r", "--raw", "-z", "--no-renames", a, b, "--", ".", *EXCLUDE)
+    raw = store.git("diff-tree", "-r", "--raw", "-z", "--no-renames", a, b, "--", ".", *code_excludes(store))
     parts = raw.split("\0")
     out = []
     i = 0
@@ -317,40 +573,314 @@ def diff_tree_entries(root, a, b):
     return out
 
 
+def shadow_excluded_many(store, paths, tracked=None):
+    """Return current shadow-excluded paths in one check-ignore subprocess."""
+    if store is None or store.kind != "shadow":
+        return set()
+    tracked = store.user_tracked() if tracked is None else tracked
+    candidates = [path for path in paths if path not in tracked]
+    if not candidates:
+        return set()
+    p = subprocess.run(["git", "-C", store.top, "check-ignore", "--no-index", "-z", "--stdin"],
+                       env=store.env(), input="".join(path + "\0" for path in candidates),
+                       capture_output=True, text=True)
+    return {path for path in p.stdout.split("\0") if path} if p.returncode == 0 else set()
+
+
+def shadow_excluded(store, path, tracked=None):
+    """Compatibility wrapper for one path; callers handling many paths use the batch helper."""
+    return path in shadow_excluded_many(store, [path], tracked)
+
+
 # ---------------------------------------------------------------- project / state
 
-def find_root(start):
-    p = subprocess.run(["git", "-C", start, "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True)
-    return p.stdout.strip() if p.returncode == 0 else os.path.abspath(start)
+def git_repo_top(start):
+    """Top of the git repository holding start (or holding its nearest existing ancestor)."""
+    probe = os.path.abspath(start)
+    while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    p = subprocess.run(["git", "-C", probe, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True, env=clean_git_env())
+    return canonical_dir(p.stdout.strip()) if p.returncode == 0 else None
+
+
+def canonical_dir(path):
+    """Absolute real path with the on-disk letter case (APFS ignores case but keeps it).
+
+    Two spellings of one directory must give one project id; os.path.realpath keeps the
+    spelling it was given, so on macOS ask the kernel for the path of an open descriptor.
+    """
+    path = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    if not os.path.exists(path):
+        suffix, ancestor = [], path
+        while not os.path.exists(ancestor) and os.path.dirname(ancestor) != ancestor:
+            suffix.append(os.path.basename(ancestor))
+            ancestor = os.path.dirname(ancestor)
+        return os.path.join(canonical_dir(ancestor), *reversed(suffix))
+    if sys.platform == "darwin" and fcntl is not None and os.path.isdir(path):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                buf = fcntl.fcntl(fd, 50, b"\0" * 1024)  # F_GETPATH
+            finally:
+                os.close(fd)
+            got = buf.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+            if got and os.path.samefile(got, path):
+                return got
+        except OSError:
+            pass
+    return path
+
+
+def is_initialized(path):
+    """`baton init` has run here: .baton/config.json exists (early v1 projects had no baton.json).
+
+    The state root ~/.baton holds only projects/, so it never makes the home directory look
+    like a project.
+    """
+    return os.path.isfile(os.path.join(path, ".baton", "config.json"))
+
+
+def is_project_dir(path, legacy=True):
+    """baton.json marks a project; with legacy=True an initialized .baton/ does too."""
+    return os.path.isfile(os.path.join(path, "baton.json")) or (legacy and is_initialized(path))
+
+
+def nested_project_dirs(root):
+    """Nearest nested projects, using the same markers as rollback ownership."""
+    found = []
+    for directory, names, _ in os.walk(root):
+        keep = []
+        for name in sorted(names):
+            full = os.path.join(directory, name)
+            if name in (".git", ".baton", ".council") or os.path.islink(full):
+                continue
+            if is_project_dir(full):
+                found.append(os.path.relpath(full, root).replace(os.sep, "/"))
+            else:
+                keep.append(name)
+        names[:] = keep
+    return found
+
+
+_CODE_EXCLUDES_CACHE = {}
+_CODE_NESTED_CACHE = {}
+
+
+def _shadow_prune_dir(name, rel_dir):
+    """Fast directory pruning for the shadow's built-in exclude rules."""
+    if name.startswith(".venv") or name in {"venv", "node_modules", "__pycache__",
+                                              "outputs", "logs", "checkpoints"}:
+        return True
+    # D001 intentionally excludes only the project's top-level data/ and models/.
+    return rel_dir == "." and name in {"data", "models"}
+
+
+def nested_project_dirs_for_code(root):
+    """Nested projects that can affect code statistics, skipping shadow-excluded trees."""
+    if root in _CODE_NESTED_CACHE:
+        return list(_CODE_NESTED_CACHE[root])
+    found = []
+    for directory, names, _ in os.walk(root):
+        rel_dir = os.path.relpath(directory, root)
+        keep = []
+        for name in sorted(names):
+            full = os.path.join(directory, name)
+            if name in (".git", ".baton", ".council") or os.path.islink(full):
+                continue
+            if _shadow_prune_dir(name, rel_dir):
+                continue
+            if is_project_dir(full):
+                found.append(os.path.relpath(full, root).replace(os.sep, "/"))
+            else:
+                keep.append(name)
+        names[:] = keep
+    _CODE_NESTED_CACHE[root] = found
+    return list(found)
+
+
+def code_excludes(store):
+    # Quote glob metacharacters so directory names such as "project[1]" stay literal.
+    root = store.project.root
+    paths = _CODE_EXCLUDES_CACHE.get(root)
+    if paths is None:
+        nested = nested_project_dirs_for_code(root)
+        paths = ["".join("[" + c + "]" if c in "[*?" else c for c in path)
+                 for path in nested]
+        _CODE_EXCLUDES_CACHE[root] = paths
+    return EXCLUDE + [":(exclude,glob)" + path + "/**" for path in paths]
+
+
+def find_project_dir(start, legacy=True):
+    """Find the nearest project dir without crossing the containing git root.
+
+    `init` passes legacy=False: a new project is placed by baton.json only, so an early-v1
+    .baton/ higher up cannot capture it without the boundary confirmation.
+    """
+    start = canonical_dir(start)
+    top = git_repo_top(start)
+    if not top:
+        return start
+    cur = start
+    while True:
+        if is_project_dir(cur, legacy):
+            return cur
+        if cur == top:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return start
+
+
+def task_has_v1_refs(st):
+    """True when Baton v1 stored checkpoints of this task in the user's repository."""
+    if st.get("snapshot_store") == "shadow":
+        return False
+    return bool(st.get("base_ref") or any(lg.get("start_ref") or lg.get("end_ref") for lg in st.get("legs", [])))
 
 
 class Project:
     def __init__(self, root):
-        self.root = os.path.abspath(root)
+        self.root = canonical_dir(root)
         self.dir = os.path.join(self.root, ".baton")
+
+    @property
+    def project_id(self):
+        real = os.path.realpath(self.root)
+        digest = hashlib.sha1(os.fsencode(real)).hexdigest()[:8]
+        return f"{os.path.basename(real)}-{digest}"
+
+    @property
+    def id_file(self):
+        return self.p("project-id")
+
+    def recorded_id(self):
+        data = read_json(self.id_file)
+        return data.get("id") if isinstance(data, dict) else None
+
+    def record_id(self):
+        write_json(self.id_file, {"id": self.project_id, "root": self.root})
+
+    def check_identity(self, warn_only=False):
+        """Refuse to run on a fresh state dir when the project folder was moved or renamed."""
+        old = self.recorded_id()
+        if old and old != self.project_id:
+            old_dir = os.path.join(os.path.dirname(self.state_dir), old)
+            if os.path.isdir(old_dir):
+                hint = "移动项目用 baton init --relink；复制项目用 baton init --fresh。"
+            else:
+                hint = "原状态目录已不存在，移动用 baton init --relink；复制或在新机器上用 baton init --fresh。"
+            message = (f"项目目录换过位置或名字：.baton/project-id 记的是 {old}，现在算出来是 {self.project_id}。"
+                       f"原来的任务状态和回滚点在 {old_dir}。{hint}"
+                       "否则新开的轮次会覆盖 .baton/runs/ 里的旧记录。")
+            if warn_only:
+                print("警告：" + message, file=sys.stderr)
+                return False
+            die(message)
+        return True
+
+    @property
+    def state_dir(self):
+        home = os.environ.get("BATON_HOME") or os.path.expanduser("~/.baton")
+        return os.path.join(os.path.abspath(os.path.expanduser(home)), "projects", self.project_id)
+
+    @property
+    def snap_git_dir(self):
+        return os.path.join(self.state_dir, "snap.git")
+
+    def store(self, task=None, st=None):
+        """SnapStore for a task: the shadow repo, unless Baton v1 already put its refs in the user repo.
+
+        A v1 task without any v1 ref (e.g. one in a non-git project) has nothing to stay
+        compatible with, so it moves to the shadow repo with its next checkpoint.
+        """
+        if task is not None:
+            if st is None:
+                st = self.read_state(task, {}) or {}
+            if task_has_v1_refs(st):
+                return SnapStore(self, "repo") if is_git(self.root) else None
+        return SnapStore(self, "shadow")
+
+    def config_layers(self):
+        """Keep the raw project layers available for v1 migration decisions."""
+        project_cfg = read_json(os.path.join(self.dir, "config.json"), {})
+        if not isinstance(project_cfg, dict):
+            project_cfg = {}
+        return project_cfg, self.read_baton_config()
+
+    @property
+    def needs_backend_migration(self):
+        return not any(isinstance(layer.get("executor"), dict) and "backend" in layer["executor"]
+                       for layer in self.config_layers())
 
     @property
     def config(self):
         base = read_json(os.path.join(SKILL_DIR, "config.json"), {})
-        project_cfg = read_json(os.path.join(self.dir, "config.json"), {})
-        if not isinstance(project_cfg, dict):
-            project_cfg = {}
-        baton_cfg = self.read_baton_config()
+        project_cfg, baton_cfg = self.config_layers()
         # quota belongs to the account-level skill configuration.  Keep the
         # project layers from changing it even though all other keys deep-merge.
         project_cfg = {k: v for k, v in project_cfg.items() if k != "quota"}
         baton_cfg = {k: v for k, v in baton_cfg.items() if k != "quota"}
-        cfg = deep_merge(deep_merge(base, project_cfg), baton_cfg)
-        judge = cfg.get("judge")
-        if not isinstance(judge, dict):
-            raise ConfigError("配置中的 judge 必须是 JSON object")
-        judge_model = judge.get("model")
-        if judge_model not in JUDGE_MODELS:
-            raise ConfigError(
-                f"judge.model 的值 {judge_model!r} 无效，只能是 opus、sonnet、haiku 或 fable"
-            )
+        layers = (project_cfg, baton_cfg)
+        mode = base.get("mode", "standard")
+        for layer in layers:
+            if "mode" in layer:
+                mode = layer["mode"]
+        if mode not in MODES:
+            raise ConfigError(f"mode 的值 {mode!r} 无效，只能是 standard 或 lean")
+        defaults = deep_merge(base, lean_overrides()) if mode == "lean" else base
+        cfg = deep_merge(deep_merge(defaults, project_cfg), baton_cfg)
+        cfg["mode"] = mode
+        project_conductor = any("conductor" in layer for layer in layers)
+        project_judge = any("judge" in layer for layer in layers)
+        if project_judge:
+            legacy_judge = {}
+            for layer in layers:
+                if isinstance(layer.get("judge"), dict):
+                    legacy_judge = deep_merge(legacy_judge, layer["judge"])
+            if not project_conductor:
+                # v1: judge was the conductor.  The monitor remains at its v2 default.
+                cfg["conductor"] = dict(cfg["conductor"], model=legacy_judge.get("model"))
+                if "council_for_major_decisions" in legacy_judge:
+                    cfg["conductor"]["council_for_major_decisions"] = legacy_judge["council_for_major_decisions"]
+            else:
+                # Early v2 files used judge for the read-only monitor.  Merge it as an alias,
+                # while an explicit monitor in the same layer takes precedence.
+                monitor = dict(defaults.get("monitor") or {})
+                for layer in layers:
+                    if isinstance(layer.get("judge"), dict):
+                        monitor = deep_merge(monitor, layer["judge"])
+                    if isinstance(layer.get("monitor"), dict):
+                        monitor = deep_merge(monitor, layer["monitor"])
+                cfg["monitor"] = monitor
+        cfg.pop("judge", None)
+        for role in ("conductor", "monitor"):
+            section = cfg.get(role)
+            if not isinstance(section, dict):
+                raise ConfigError(f"配置中的 {role} 必须是 JSON object")
+            model = section.get("model")
+            if role == "conductor":
+                if not isinstance(model, str) or model not in CONDUCTOR_MODELS:
+                    raise ConfigError(
+                        f"conductor.model 的值 {model!r} 无效，只能是 opus、sonnet、haiku 或 fable"
+                    )
+            elif not isinstance(model, str) or not model.strip():
+                raise ConfigError("monitor.model 必须是非空字符串")
+        if not isinstance(cfg.get("executor"), dict):
+            raise ConfigError("配置中的 executor 必须是 JSON object")
+        if not any(isinstance(layer.get("executor"), dict) and "backend" in layer["executor"]
+                   for layer in layers):
+            cfg["executor"]["backend"] = "codex"
+        cfg["project"] = {"root": self.root, "id": self.project_id, "state_dir": self.state_dir}
         return cfg
+
+    @property
+    def judge_renamed_to_monitor(self):
+        project_cfg, baton_cfg = self.config_layers()
+        return (any("conductor" in layer for layer in (project_cfg, baton_cfg)) and
+                any("judge" in layer for layer in (project_cfg, baton_cfg)))
 
     @property
     def baton_config_path(self):
@@ -384,6 +914,9 @@ class Project:
     def task_dir(self, task):
         return self.p("tasks", task)
 
+    def state_task_dir(self, task):
+        return os.path.join(self.state_dir, "tasks", task)
+
     def runs_dir(self, task):
         return self.p("runs", task)
 
@@ -391,22 +924,101 @@ class Project:
         return os.path.join(self.runs_dir(task), f"leg-{n:03d}.{suffix}")
 
     def state_path(self, task):
+        return os.path.join(self.state_task_dir(task), "state.json")
+
+    def state_lock_path(self, task):
+        return os.path.join(self.state_task_dir(task), "state.lock")
+
+    def launch_lock_path(self):
+        return os.path.join(self.state_dir, "launch.lock")
+
+    def legacy_state_path(self, task):
         return os.path.join(self.task_dir(task), "state.json")
 
+    def import_legacy_state(self, task):
+        """Import a v1 task state once, under the state lock; project files stay where they are.
+
+        While a Baton v1 runner is still running the task's leg, nothing is imported: that
+        runner keeps writing the old file, so a copy would split the state.  The v1 state is
+        returned instead, for read-only use.
+        """
+        target = self.state_path(task)
+        if os.path.exists(target):
+            return None
+        legacy = self.legacy_state_path(task)
+        old = read_json(legacy) if os.path.isfile(legacy) else None
+        if not isinstance(old, dict):
+            return None
+        leg = old["legs"][-1] if old.get("legs") else None
+        if self.legacy_state_in_flight(task, old=old, leg=leg):
+            return old
+        os.makedirs(self.state_task_dir(task), exist_ok=True)
+        with _locked(self.state_lock_path(task)):
+            if not os.path.exists(target):
+                old["imported_from_v1"] = stamp()
+                write_json(target, old)
+        return None
+
+    def legacy_state_in_flight(self, task, old=None, leg=None):
+        """Whether a v1 runner may still be writing the project-local state file."""
+        if os.path.exists(self.state_path(task)):
+            return False
+        if old is None:
+            legacy = self.legacy_state_path(task)
+            old = read_json(legacy) if os.path.isfile(legacy) else None
+        if not isinstance(old, dict):
+            return False
+        if leg is None:
+            leg = old["legs"][-1] if old.get("legs") else None
+        if not leg or leg.get("status") != "running":
+            return False
+        pid = leg.get("runner_pid")
+        if pid:
+            marker = runner_marker(task, leg.get("n"))
+            if pid_alive(pid, marker):
+                return True
+            # A live PID without the marker may be a reused PID.  Keep the conservative
+            # v1 protection for one day, then allow the stale state to be imported.
+            started = leg.get("started_at")
+            try:
+                recent = started is not None and now() - float(started) <= 24 * 60 * 60
+            except (TypeError, ValueError):
+                recent = False
+            return recent and pid_alive(pid)
+        started = leg.get("started_at")
+        try:
+            return started is not None and now() - float(started) < 30
+        except (TypeError, ValueError):
+            return False
+
+    def task_exists(self, task):
+        return (os.path.isfile(os.path.join(self.task_dir(task), "brief.md"))
+                or os.path.exists(self.state_path(task))
+                or os.path.exists(self.legacy_state_path(task)))
+
+    def read_state(self, task, default=None):
+        in_flight = self.import_legacy_state(task)
+        if in_flight is not None:
+            return in_flight
+        return read_json(self.state_path(task), default)
+
     def require_init(self):
-        if not os.path.isdir(self.dir):
+        if not is_initialized(self.root):
             die(f"{self.root} 还没有初始化，先运行 baton init")
 
     def load_state(self, task):
-        st = read_json(self.state_path(task))
+        st = self.read_state(task)
         if st is None:
             die(f"任务 {task} 不存在（{self.state_path(task)}）")
         return st
 
     def update_state(self, task, fn):
         """Read-modify-write the task state under a file lock."""
-        os.makedirs(self.task_dir(task), exist_ok=True)
-        with open(os.path.join(self.task_dir(task), "state.lock"), "w") as lock:
+        if self.import_legacy_state(task) is not None:
+            die(f"任务 {task} 还有 Baton v1 的一轮在运行，它还在写旧的状态文件；"
+                "等这一轮结束再用新版本操作这个任务")
+        os.makedirs(self.state_task_dir(task), exist_ok=True)
+        with open(self.state_lock_path(task), "w") as lock:
             if fcntl:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             st = read_json(self.state_path(task), {})
@@ -415,8 +1027,12 @@ class Project:
             return st
 
     def tasks(self):
-        d = self.p("tasks")
-        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+        found = set()
+        for d in (self.p("tasks"), os.path.join(self.state_dir, "tasks")):
+            if os.path.isdir(d):
+                found.update(name for name in os.listdir(d)
+                             if os.path.isdir(os.path.join(d, name)) and TASK_RE.fullmatch(name))
+        return sorted(found)
 
 
 def current_leg(st):
@@ -457,6 +1073,8 @@ def kill_codex(leg):
 
 def refresh_runner_liveness(project, task, st):
     """A leg marked running whose runner is gone died without cleanup: stop its codex, mark failed."""
+    if project.legacy_state_in_flight(task):
+        return st
     leg = current_leg(st)
     if not leg or leg.get("status") != "running":
         return st
@@ -582,7 +1200,8 @@ def fill(template, mapping):
 
 def protocol_text(project, task):
     cfg = project.config
-    return fill(read_text(os.path.join(REFERENCES, "executor-protocol.md")), {
+    protocol_name = "executor-protocol-lean.md" if cfg.get("mode") == "lean" else "executor-protocol.md"
+    return fill(read_text(os.path.join(REFERENCES, protocol_name)), {
         "TASK": task,
         "BATON_DIR": project.dir,
         "LOG": project.p("log.md"),
@@ -824,13 +1443,78 @@ def write_baton_gitignore(project):
             f.write("\n" + "\n".join(missing) + "\n")
 
 
+def _rebase_paths(obj, old_root, new_root):
+    """Rewrite absolute paths under old_root (as stored in task state) to new_root."""
+    if isinstance(obj, str):
+        if obj == old_root or obj.startswith(old_root + os.sep):
+            return new_root + obj[len(old_root):]
+        return obj
+    if isinstance(obj, list):
+        return [_rebase_paths(x, old_root, new_root) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _rebase_paths(v, old_root, new_root) for k, v in obj.items()}
+    return obj
+
+
+def relink_state(project, old_id):
+    """After the project folder moved: move its old state dir to the new id and fix stored paths."""
+    old_dir = os.path.join(os.path.dirname(project.state_dir), old_id)
+    if not os.path.isdir(old_dir):
+        die(f"找不到原来的状态目录 {old_dir}；如果这是复制项目或换了机器，请用 baton init --fresh")
+    if os.path.exists(project.state_dir):
+        die(f"新的状态目录 {project.state_dir} 已经存在，不覆盖；先确认里面没有要保留的东西，移走后再试")
+    id_data = read_json(project.id_file) or {}
+    old_root = id_data.get("root")
+    if old_root and os.path.isdir(old_root):
+        original_id = read_json(os.path.join(old_root, ".baton", "project-id")) or {}
+        if original_id.get("id") == old_id:
+            die(f"检测到这是复制项目：原目录 {old_root} 仍存在且 project-id 仍为 {old_id}；"
+                "为避免搬走原项目状态，请改用 baton init --fresh")
+    os.rename(old_dir, project.state_dir)
+    if old_root and old_root != project.root:
+        tasks_dir = os.path.join(project.state_dir, "tasks")
+        for task in (os.listdir(tasks_dir) if os.path.isdir(tasks_dir) else []):
+            path = os.path.join(tasks_dir, task, "state.json")
+            st = read_json(path)
+            if isinstance(st, dict):
+                write_json(path, _rebase_paths(st, old_root, project.root))
+    project.record_id()
+    print(f"已把 {old_dir} 接到 {project.state_dir}")
+
+
 def cmd_init(project, args):
+    try:
+        validate_external_state(project)
+    except RuntimeError as e:
+        die(str(e))
+    top = git_repo_top(project.root)
+    if top and project.root != top:
+        print(f"项目目录：{project.root}")
+        print(f"git 顶层：{top}")
+        if not getattr(args, "accept_boundary", False):
+            die("项目目录与 git 顶层不同；确认边界后加 --accept-boundary 重试（未创建任何文件）")
+    old_id = project.recorded_id()
+    if old_id and old_id != project.project_id:
+        relink = getattr(args, "relink", False)
+        fresh = getattr(args, "fresh", False)
+        if relink and fresh:
+            die("--relink 和 --fresh 不能同时使用")
+        if fresh:
+            if os.path.exists(project.state_dir) and os.listdir(project.state_dir):
+                die(f"新的状态目录 {project.state_dir} 已经存在，不覆盖；请先确认后再用 --fresh")
+            print(f"复制项目将使用新的项目外状态目录：{project.state_dir}（原状态保留在旧项目）")
+        elif not relink:
+            project.check_identity()  # explains the move and exits
+        else:
+            relink_state(project, old_id)
     # Validate an existing baton.json before changing the project state.  When
     # it is absent, the skill defaults and any existing .baton override form
     # the values used for the generated file below.
     project.config
     for d in ("tasks", "reports", "reviews", "decisions", "runs"):
         os.makedirs(project.p(d), exist_ok=True)
+    project = Project(project.root)  # the newly created directory now has its on-disk spelling
+    os.makedirs(project.state_dir, exist_ok=True)
     write_baton_gitignore(project)
     if not os.path.exists(project.p("config.json")):
         write_json(project.p("config.json"), {
@@ -839,11 +1523,18 @@ def cmd_init(project, args):
     if not os.path.exists(project.baton_config_path):
         cfg = project.config
         write_json(project.baton_config_path, {
-            "judge": {
-                "model": cfg["judge"]["model"],
-                "council_for_major_decisions": cfg["judge"].get("council_for_major_decisions", True),
+            "conductor": {
+                "model": cfg["conductor"]["model"],
+                "council_for_major_decisions": cfg["conductor"]["council_for_major_decisions"],
+            },
+            "monitor": {
+                "model": cfg["monitor"]["model"],
+                "reasoning_effort": cfg["monitor"].get("reasoning_effort"),
+                "final_reasoning_effort": cfg["monitor"].get("final_reasoning_effort"),
+                "timeout_minutes": cfg["monitor"].get("timeout_minutes"),
             },
             "executor": {
+                "backend": cfg["executor"]["backend"],
                 "model": cfg["executor"]["model"],
                 "reasoning_effort": cfg["executor"]["reasoning_effort"],
                 "service_tier": cfg["executor"]["service_tier"],
@@ -860,11 +1551,119 @@ def cmd_init(project, args):
     if not os.path.exists(project.p("supervision.md")):
         with open(project.p("supervision.md"), "w") as f:
             f.write("# Baton 监管记录\n\nOpus 每 30 分钟一次的检查结论。\n")
+    ensure_shadow(project)
+    project.record_id()
     print(f"已初始化 {project.dir}")
+    print(f"项目外状态目录：{project.state_dir}")
     if not getattr(args, "no_statusline", False):
         print(statusline_install(project))
-    if not is_git(project.root):
-        print("注意：不是 git 仓库，回滚点（checkpoint）不可用。建议先 git init；之后再运行一次 baton init。")
+    print_snapshot_scope(project)
+
+
+def _human_kb(kb):
+    for unit in ("KB", "MB", "GB"):
+        if kb < 1024 or unit == "GB":
+            return f"{kb:.0f} {unit}" if unit == "KB" else f"{kb:.1f} {unit}"
+        kb /= 1024.0
+
+
+def _du(path):
+    try:
+        p = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=30)
+        if p.returncode == 0 and p.stdout.split():
+            return _human_kb(int(p.stdout.split()[0]))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return "?"
+
+
+def print_snapshot_scope(project, max_depth=4):
+    """Show what snapshots cover: top-level entries, nested bulky dirs and nested projects."""
+    store = SnapStore(project, "shadow")
+    tracked = store.user_tracked()
+    ignored_cache = {}
+    sampled_dirs = set()
+
+    def label(rel):
+        bare = rel.rstrip("/")
+        tracked_here = {p for p in tracked if p == bare or p.startswith(bare + "/")}
+        is_excluded = excluded(rel)
+        if tracked_here and is_excluded:
+            result = "快照（用户仓库已跟踪）"
+        else:
+            result = "排除" if is_excluded else "快照"
+        if bare in sampled_dirs:
+            result += "（按抽样判定）"
+        return result
+
+    def excluded(rel):
+        bare = rel.rstrip("/")
+        full = os.path.join(project.root, bare)
+        paths = [bare]
+        if os.path.isdir(full) and not os.path.islink(full):
+            files = []
+            for dirpath, dirnames, filenames in os.walk(full):
+                rel_dir = os.path.relpath(dirpath, project.root)
+                dirnames[:] = [d for d in dirnames
+                               if not os.path.islink(os.path.join(dirpath, d))
+                               and not _shadow_prune_dir(d, rel_dir)]
+                for filename in filenames:
+                    files.append(os.path.relpath(os.path.join(dirpath, filename), project.root)
+                                 .replace(os.sep, "/"))
+                    if len(files) > 5000:
+                        break
+                if len(files) > 5000:
+                    break
+            if len(files) > 5000:
+                sampled_dirs.add(bare)
+                files = files[:5000]
+            paths.extend(files)
+        pending = [path for path in paths if path not in ignored_cache]
+        if pending:
+            ignored = shadow_excluded_many(store, pending, tracked=set())
+            ignored_cache.update({path: path in ignored for path in pending})
+        if ignored_cache.get(bare, False):
+            return True
+        if not os.path.isdir(full) or os.path.islink(full):
+            return False
+        return bool(paths[1:]) and all(ignored_cache.get(path, False) for path in paths[1:])
+
+    print("快照覆盖范围（项目顶层条目 · 大小 · 是否排除）：")
+    for name in sorted(os.listdir(project.root)):
+        if name == ".git":
+            continue
+        full = os.path.join(project.root, name)
+        is_dir = os.path.isdir(full) and not os.path.islink(full)
+        print(f"  {label(name)}  {_du(full):>9}  {name + ('/' if is_dir else '')}")
+    bulky, nested = [], []
+    skip = {".git", ".baton", ".council", "node_modules", "__pycache__", "venv"}
+    for dirpath, dirnames, _ in os.walk(project.root):
+        rel_dir = os.path.relpath(dirpath, project.root)
+        depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        keep = []
+        for d in sorted(dirnames):
+            rel = d if rel_dir == "." else os.path.join(rel_dir, d)
+            if d in skip or d.startswith(".venv") or os.path.islink(os.path.join(dirpath, d)):
+                continue
+            if is_project_dir(os.path.join(dirpath, d)):
+                nested.append(rel)
+                continue
+            if depth >= 1 and d in BULKY_DIR_NAMES:
+                bulky.append(rel)
+            # Keep walking excluded parents so the confirmation list still names a
+            # bulky directory such as exp/run1/checkpoints/ inside them.
+            if depth + 1 < max_depth:
+                keep.append(d)
+        dirnames[:] = keep
+    if bulky:
+        print("嵌套的 data/models/outputs/logs/checkpoints 目录（大小 · 是否排除）：")
+        for rel in bulky:
+            print(f"  {label(rel + '/')}  {_du(os.path.join(project.root, rel)):>9}  {rel}/")
+    if nested:
+        print("嵌套项目（有自己的 Baton，外层任务的回滚不会改动它们）：" + "，".join(nested))
+    print(f"排除规则在 {os.path.join(project.snap_git_dir, 'info', 'exclude')}，项目内的 .gitignore 也生效，"
+          "项目目录以上的 .gitignore 不生效；用户仓库已跟踪的文件即使被忽略也会进快照。"
+          "请和用户确认范围；要调整就编辑这个文件，下次快照起生效。")
 
 
 def cmd_statusline(project, args):
@@ -897,7 +1696,7 @@ def running_task(project, exclude=None):
     for task in project.tasks():
         if task == exclude:
             continue
-        st = read_json(project.state_path(task), {}) or {}
+        st = project.read_state(task, {}) or {}
         if not st.get("legs"):
             continue
         st = refresh_runner_liveness(project, task, st)
@@ -909,10 +1708,11 @@ def running_task(project, exclude=None):
 
 def launch_leg(project, task, kind, prompt):
     os.makedirs(project.dir, exist_ok=True)
-    with open(project.p("launch.lock"), "w") as launch_lock:
+    os.makedirs(project.state_dir, exist_ok=True)
+    with open(project.launch_lock_path(), "w") as launch_lock:
         if fcntl:
             fcntl.flock(launch_lock, fcntl.LOCK_EX)  # one launch at a time per project
-        st = read_json(project.state_path(task), {}) or {}
+        st = project.read_state(task, {}) or {}
         st = refresh_runner_liveness(project, task, st) if st.get("legs") else st
         leg = current_leg(st) if st else None
         if leg and leg.get("status") == "running":
@@ -927,12 +1727,15 @@ def launch_leg(project, task, kind, prompt):
         n = len(st.get("legs", [])) + 1
         os.makedirs(project.runs_dir(task), exist_ok=True)
         prompt_path = project.leg_path(task, n, "prompt.md")
+        if os.path.exists(prompt_path):
+            die(f"{prompt_path} 已经存在，和任务状态里的轮次对不上（项目目录可能换过位置，或状态目录变了）；"
+                "为免覆盖旧的运行记录，先查明原因；移动项目用 baton init --relink")
         with open(prompt_path, "w") as f:
             f.write(prompt)
 
         print(codex_quota.describe(safe_quota(block=True, notify=True)))
 
-        start_ref, err = try_checkpoint(project.root, task, f"leg-{n:03d}-start")
+        start_ref, err = try_checkpoint(project, task, f"leg-{n:03d}-start", st=st)
         if err:
             print(f"注意：本轮起点回滚点没建成：{err}")
         last_path = project.leg_path(task, n, "last.json")
@@ -970,10 +1773,14 @@ def launch_leg(project, task, kind, prompt):
     ex = cfg["executor"]
     print(f"BATON::STARTED task={task} leg={n} kind={kind} model={ex['model']} "
           f"effort={ex['reasoning_effort']} service_tier={ex['service_tier']} "
-          f"judge={cfg['judge']['model']} runner_pid={runner.pid}")
+          f"judge={cfg['conductor']['model']} runner_pid={runner.pid} monitor={cfg['monitor']['model']}")
     print(f"回滚点：{start_ref or '无'}")
-    print(f"下一步：用后台方式运行 `baton wait {task}`，leg 结束或 "
-          f"{project.config['supervision']['interval_minutes']} 分钟监管时间到会唤醒你。")
+    interval = project.config["supervision"]["interval_minutes"]
+    if interval:
+        next_step = f"下一步：用后台方式运行 `baton wait {task}`，leg 结束或 {interval} 分钟监管时间到会唤醒你。"
+    else:
+        next_step = "下一步：用后台方式运行 `baton wait {task}`；本模式只在 leg 结束或额度不足时返回。".format(task=task)
+    print(next_step)
 
 
 def cmd_start(project, args):
@@ -985,20 +1792,22 @@ def cmd_start(project, args):
         die(f"缺少任务简报 {brief_path}；先 baton new {args.task} 并填写")
     if "（待填）" in brief or "{{TASK}}" in brief:
         die(f"简报里还有未填写的模板占位（「（待填）」或 {{{{TASK}}}}）：{brief_path}")
-    st = read_json(project.state_path(args.task), {}) or {}
+    st = project.read_state(args.task, {}) or {}
     if st.get("thread_id"):
         die(f"任务 {args.task} 已有 Codex 会话 {st['thread_id']}；继续请用 baton resume")
-    if is_git(project.root):
-        r = subprocess.run(["git", "check-ref-format", f"refs/baton/{args.task}/base"])
-        if r.returncode != 0:
-            die(f"任务名 {args.task} 不能用作 git ref，请换一个")
-        write_baton_gitignore(project)
-        if baton_statusline_installed(project):
-            warn = ensure_settings_ignored(project)
-            if warn:
-                print(warn)
+    r = subprocess.run(["git", "check-ref-format", f"refs/baton/{args.task}/base"])
+    if r.returncode != 0:
+        die(f"任务名 {args.task} 不能用作 git ref，请换一个")
+    write_baton_gitignore(project)
+    if is_git(project.root) and baton_statusline_installed(project):
+        warn = ensure_settings_ignored(project)
+        if warn:
+            print(warn)
     if not st.get("base_ref"):
-        ref, err = try_checkpoint(project.root, args.task, "base")
+        if not st.get("legs"):
+            # a task started by v2 keeps every checkpoint in the shadow repo
+            st = project.update_state(args.task, lambda s: s.update(snapshot_store="shadow", task=args.task))
+        ref, err = try_checkpoint(project, args.task, "base", st=st)
         if err:
             die(f"任务起点回滚点没建成：{err}")
         project.update_state(args.task, lambda s: s.update(base_ref=ref, task=args.task))
@@ -1096,7 +1905,7 @@ def cmd_run(project, args):
                 reason = "stopped"
                 _interrupt(proc)
                 break
-            last_sup = (read_json(project.state_path(task), {}) or {}).get("last_supervision_at", leg["started_at"])
+            last_sup = (project.read_state(task, {}) or {}).get("last_supervision_at", leg["started_at"])
             if limit and now() - last_sup > limit * 60:
                 reason = "paused_unsupervised"
                 _interrupt(proc)
@@ -1128,11 +1937,11 @@ def cmd_run(project, args):
     else:
         status = "failed"
 
-    end_ref, cp_err = try_checkpoint(project.root, task, f"leg-{n:03d}-end")
+    end_ref, cp_err = try_checkpoint(project, task, f"leg-{n:03d}-end")
     diff = None
     if end_ref and leg.get("start_ref"):
         try:
-            diff = shortstat(project.root, leg["start_ref"], end_ref)
+            diff = shortstat(project.store(task), leg["start_ref"], end_ref)
         except Exception:  # noqa: BLE001
             diff = None
     events, _ = read_events(leg["events"])
@@ -1169,9 +1978,19 @@ def report_baseline(st, leg):
     return st.get("base_ref")
 
 
+LEAN_HINT = "lean 模式：请把主会话的思考深度设为 medium（conductor.reasoning_effort）。"
+
+
+def print_lean_hint(project):
+    if project.config.get("mode") == "lean":
+        print(LEAN_HINT)
+
+
 def leg_event_text(project, task, leg):
     ev = LEG_END_EVENTS.get(leg["status"], str(leg["status"]).upper())
     lines = [f"BATON::EVENT {ev} task={task} leg={leg['n']}"]
+    if project.config.get("mode") == "lean":
+        lines.append(LEAN_HINT)
     res = leg.get("result") if isinstance(leg.get("result"), dict) else {}
     if res.get("summary"):
         lines.append(f"执行者摘要：{clip(str(res['summary']), 1500)}")
@@ -1186,11 +2005,12 @@ def leg_event_text(project, task, leg):
         if (f or a or d) and not leg.get("log_grew"):
             lines.append("注意：有代码改动但 log.md 本轮没有新增记录。")
     if ev == "REPORT" and leg.get("end_ref"):
-        st = read_json(project.state_path(task), {}) or {}
+        st = project.read_state(task, {}) or {}
         base = report_baseline(st, leg)
-        if base:
+        store = project.store(task, st)
+        if base and store:
             try:
-                f, a, d = shortstat(project.root, base, leg["end_ref"])
+                f, a, d = shortstat(store, base, leg["end_ref"])
                 lines.append(f"自上次汇报以来（{base}）：{f} 个文件，+{a} −{d}；审阅用 baton diff {task} --since report")
             except Exception:  # noqa: BLE001
                 pass
@@ -1212,26 +2032,28 @@ def leg_event_text(project, task, leg):
 def cmd_wait(project, args):
     project.require_init()
     minutes = args.tick if args.tick is not None else project.config["supervision"]["interval_minutes"]
-    tick = float(minutes) * 60
     last_quota_check = 0.0
     while True:
         st = refresh_runner_liveness(project, args.task, project.load_state(args.task))
         leg = current_leg(st)
         if not leg:
             print(f"BATON::EVENT IDLE task={args.task}：还没有启动任何一轮")
+            print_lean_hint(project)
             return
         if leg["status"] != "running":
             if leg.get("reported"):
                 print(f"BATON::EVENT IDLE task={args.task} leg={leg['n']}：没有运行中的一轮，"
                       f"上一轮状态 {leg['status']}（已处理过）。需要继续就 baton resume。")
+                print_lean_hint(project)
                 return
             print(leg_event_text(project, args.task, leg), flush=True)
             mark_reported(project, args.task)
             return
         elapsed_sup = now() - st.get("last_supervision_at", leg["started_at"])
-        if elapsed_sup >= tick:
+        if supervision_tick_due(elapsed_sup, minutes):
             print(f"BATON::EVENT TICK task={args.task} leg={leg['n']}：距上次监管 {fmt_dur(elapsed_sup)}，"
                   f"本轮已运行 {fmt_dur(now() - leg['started_at'])}")
+            print_lean_hint(project)
             print("下一步：" + NEXT_STEP["TICK"])
             return
         if now() - last_quota_check > 300:
@@ -1243,16 +2065,25 @@ def cmd_wait(project, args):
             if fresh:
                 project.update_state(args.task, lambda s: s.update(quota_alerted=sorted(set((s.get("quota_alerted") or []) + keys))))
                 print(f"BATON::EVENT QUOTA_LOW task={args.task} leg={leg['n']}")
+                print_lean_hint(project)
                 print(codex_quota.describe(data))
                 print("下一步：" + NEXT_STEP["QUOTA_LOW"])
                 return
         time.sleep(10)
 
 
+def supervision_tick_due(elapsed_seconds, interval_minutes):
+    """Whether a wait call should return a periodic TICK event."""
+    return float(interval_minutes) > 0 and elapsed_seconds >= float(interval_minutes) * 60
+
+
 def cmd_status(project, args):
     project.require_init()
     task = args.task
-    st = refresh_runner_liveness(project, task, project.load_state(task))
+    v1_in_flight = project.legacy_state_in_flight(task)
+    st = project.load_state(task)
+    if not v1_in_flight:
+        st = refresh_runner_liveness(project, task, st)
     cfg = project.config
     leg = current_leg(st)
     print(f"# Baton 状态 · {task} · {stamp()}")
@@ -1293,25 +2124,33 @@ def cmd_status(project, args):
         print("错误：" + clip(e, 400))
 
     now_commit = None
-    if is_git(project.root):
+    store = project.store(task, st)
+    if store:
         print("\n## 代码改动（不含 .baton/ .council/）")
         try:
-            now_commit = snapshot(project.root, "baton status probe")
+            now_commit = store.snapshot("baton status probe")
         except Exception as e:  # noqa: BLE001
             print(f"（快照失败，无法统计改动：{e}）")
     if now_commit:
         for label, ref in (("任务起点", st.get("base_ref")), ("本轮起点", leg.get("start_ref")),
                            ("上次监管", sup.get("ref"))):
             if ref:
-                f, a, d = shortstat(project.root, ref, now_commit)
+                f, a, d = shortstat(store, ref, now_commit)
                 print(f"相对{label} {ref}：{f} 个文件，+{a} −{d}")
         if leg.get("start_ref"):
-            stat_out = git(project.root, "diff", "--stat=120", leg["start_ref"], now_commit, "--", ".", *EXCLUDE, check=False)
+            stat_out = store.git("diff", "--stat=120", leg["start_ref"], now_commit, "--", ".", *code_excludes(store), check=False)
             print(stat_out.rstrip()[-4000:] or "（本轮暂无改动）")
-            pairs = [(s, p) for _, _, s, p in diff_tree_entries(project.root, leg["start_ref"], now_commit)]
-            deleted = [p for s, p in pairs if s == "D"]
+            pairs = [(s, p) for _, _, s, p in diff_tree_entries(store, leg["start_ref"], now_commit)]
+            tracked = store.user_tracked() if store.kind == "shadow" else set()
+            deleted_paths = [p for s, p in pairs if s == "D"]
+            excluded_set = shadow_excluded_many(store, deleted_paths, tracked)
+            deleted = [p for p in deleted_paths if p not in excluded_set]
+            excluded_deleted = [p for p in deleted_paths if p in excluded_set]
             if deleted:
                 print(f"注意：本轮删除了 {len(deleted)} 个文件（含改名前的旧路径）：" + "，".join(deleted[:20]))
+            if excluded_deleted:
+                print("注意：以下路径当前被影子仓库排除，相对旧回滚点显示为删除："
+                      + "，".join(excluded_deleted[:20]))
             risky = [p for _, p in pairs if re.search(r"(^|/)(\.github|\.gitlab-ci|Dockerfile|pyproject\.toml|package(-lock)?\.json|requirements.*\.txt|setup\.(py|cfg)|go\.mod|Cargo\.toml)", p)]
             if risky:
                 print("注意：改到了构建/依赖/CI 文件：" + "，".join(risky[:20]))
@@ -1343,6 +2182,10 @@ def cmd_status(project, args):
     tc = cfg["supervision"].get("test_command")
     print(f"\n验证命令：{tc}" if tc else "\n验证命令：未配置（.baton/config.json → supervision.test_command）")
 
+    if v1_in_flight:
+        print("提示：Baton v1 这一轮仍在运行，未写入 pending_supervision；等它结束后再用 v2 命令监管。")
+        return
+
     pend = {"leg": leg["n"], "events_offset": events_end, "log_offset": log_end,
             "commit": now_commit, "at": now()}
     project.update_state(task, lambda s: s.update(pending_supervision=pend))
@@ -1351,6 +2194,8 @@ def cmd_status(project, args):
 def cmd_supervised(project, args):
     project.require_init()
     task = args.task
+    if project.legacy_state_in_flight(task):
+        die("任务还有 Baton v1 的一轮在运行，暂不写监管记录；等这一轮结束后再操作")
     st = project.load_state(task)
     leg = current_leg(st)
     pend = st.get("pending_supervision")
@@ -1359,13 +2204,14 @@ def cmd_supervised(project, args):
         pend = None
     label = f"tick-{stamp(fmt='%Y%m%d-%H%M%S')}"
     ref, err = None, None
-    if pend and pend.get("commit"):
+    store = project.store(task, st)
+    if pend and pend.get("commit") and store:
         try:
-            ref = store_ref(project.root, task, label, pend["commit"])
+            ref = store_ref(store, task, label, pend["commit"])
         except Exception as e:  # noqa: BLE001
             err = str(e)
     else:
-        ref, err = try_checkpoint(project.root, task, label)
+        ref, err = try_checkpoint(project, task, label, st=st)
     events_off = pend["events_offset"] if pend else (read_events(leg["events"])[1] if leg else 0)
     log_off = pend["log_offset"] if pend else file_size(project.p("log.md"))
     since = pend["at"] if pend else now()
@@ -1433,20 +2279,24 @@ def cmd_steer(project, args):
 
 def cmd_checkpoint(project, args):
     check_task(args.task)
+    if not project.task_exists(args.task):
+        die(f"任务 {args.task} 不存在（没有简报或状态文件）")
+    if project.legacy_state_in_flight(args.task):
+        die("任务还有 Baton v1 的一轮在运行，暂不建立回滚点；等这一轮结束后再操作")
     label = args.label or f"manual-{stamp(fmt='%Y%m%d-%H%M%S')}"
     if not LABEL_RE.fullmatch(label):
         die("标签只能用字母、数字、下划线和连字符")
-    if not is_git(project.root):
-        die("非 git 仓库，无法建立回滚点")
-    ref, err = try_checkpoint(project.root, args.task, label)
+    ref, err = try_checkpoint(project, args.task, label)
     if err:
         die(f"回滚点没建成：{err}")
     print(ref)
 
 
 def cmd_refs(project, args):
-    out = git(project.root, "for-each-ref", "--sort=creatordate",
-              "--format=%(creatordate:format:%m-%d %H:%M)  %(refname)", f"refs/baton/{args.task}", check=False)
+    store = project.store(args.task)
+    out = store.git("for-each-ref", "--sort=creatordate",
+                    "--format=%(creatordate:format:%m-%d %H:%M)  %(refname)", f"refs/baton/{args.task}",
+                    check=False) if store and (store.kind == "repo" or os.path.isdir(store.git_dir)) else ""
     print(out.rstrip() or "（无回滚点）")
 
 
@@ -1458,12 +2308,27 @@ def cmd_diff(project, args):
             "report": leg and report_baseline(st, leg) if leg else None}.get(args.since, args.since)
     if not base:
         die("没有对应的回滚点")
+    store = project.store(args.task, st)
+    if store is None:
+        die("这个任务建立于 Baton v1，项目又不是 git 仓库，没有回滚点")
+    if not store.has_commit(base):
+        die(f"找不到回滚点 {base}；可用的回滚点见 baton refs {args.task}")
     try:
-        target = snapshot(project.root, "baton diff probe")
+        target = store.snapshot("baton diff probe")
     except Exception as e:  # noqa: BLE001
         die(f"快照失败：{e}")
     extra = ["--stat=120"] if args.stat else []
-    sys.stdout.write(git(project.root, "diff", *extra, base, target, "--", ".", *EXCLUDE, check=False))
+    output = store.git("diff", *extra, base, target, "--", ".", *code_excludes(store), check=False)
+    sys.stdout.write(output)
+    tracked = store.user_tracked() if store.kind == "shadow" else set()
+    deleted_paths = [path for _, _, status_, path in diff_tree_entries(store, base, target) if status_ == "D"]
+    excluded_set = shadow_excluded_many(store, deleted_paths, tracked)
+    excluded = [path for path in deleted_paths if path in excluded_set]
+    if excluded:
+        if output and not output.endswith("\n"):
+            print()
+        print("注意：以下路径当前被影子仓库排除，相对旧回滚点显示为删除，diff 不代表会被 rollback 写回："
+              + "，".join(excluded[:20]))
 
 
 # ---------------------------------------------------------------- rollback
@@ -1484,10 +2349,34 @@ def _under(path, prefixes):
     return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
-def _backup(top, full, backup_dir):
-    dest = os.path.join(backup_dir, os.path.relpath(full, top))
+def _backup_destination(backup_dir, rel, manifest=None):
+    """Choose a backup path, preserving case-only collisions with a manifest entry."""
+    dest = os.path.join(backup_dir, rel)
     if os.path.lexists(dest):
-        raise RuntimeError(f"备份目标已存在：{dest}")
+        parent, name = os.path.dirname(dest), os.path.basename(dest)
+        try:
+            names = os.listdir(parent)
+        except OSError:
+            names = []
+        exact = name in names
+        case_conflict = (not exact and any(n.casefold() == name.casefold() for n in names))
+        if not case_conflict:
+            raise RuntimeError(f"备份目标已存在：{dest}")
+        stem = dest
+        n = 2
+        while os.path.lexists(dest):
+            dest = f"{stem}.{n}"
+            n += 1
+        if manifest is not None:
+            manifest.append({"original": rel.replace(os.sep, "/"),
+                             "backup": os.path.relpath(dest, backup_dir).replace(os.sep, "/")})
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    return dest
+
+
+def _backup(top, full, backup_dir, manifest=None):
+    rel = os.path.relpath(full, top)
+    dest = _backup_destination(backup_dir, rel, manifest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     if os.path.islink(full) or not os.path.isdir(full):
         shutil.copy2(full, dest, follow_symlinks=False)
@@ -1512,51 +2401,89 @@ def cmd_rollback(project, args):
 
     Only worktree files change: HEAD, branches and the real index stay as they are. The current
     state is checkpointed first, and every file that will be overwritten or deleted is copied
-    byte for byte to .baton/rollback-backup/<name>/ before anything changes. Nothing is written
-    or deleted through a symlinked directory or inside a submodule.
+    byte for byte to <state dir>/rollback-backup/<name>/ before anything changes. Nothing is
+    written or deleted through a symlinked directory or inside a submodule.
     """
     root = project.root
-    if not is_git(root):
-        die("非 git 仓库，无法回滚")
-    target = git(root, "rev-parse", "--verify", "-q", f"{args.ref}^{{commit}}", check=False).strip()
+    st = project.load_state(args.task)
+    store = project.store(args.task, st)
+    if store is None:
+        die("这个任务建立于 Baton v1，项目又不是 git 仓库，无法回滚")
+    target = store.git("rev-parse", "--verify", "-q", f"{args.ref}^{{commit}}", check=False).strip() \
+        if store.kind == "repo" or os.path.isdir(store.git_dir) else ""
     if not target:
         die(f"找不到回滚点 {args.ref}")
-    st = project.load_state(args.task)
     leg = current_leg(st)
     if leg and leg["status"] == "running":
         die("执行者仍在运行，先 baton stop")
     if not args.yes:
         print(f"将把 {root} 下的工作区文件（不含 .baton/ .council/）恢复到 {args.ref}。HEAD、分支和暂存区不变。")
-        print("当前状态会先存成回滚点，要改写或删除的文件会先原样备份到 .baton/rollback-backup/。子模块内部不在回滚范围内。")
+        print(f"当前状态会先存成回滚点，要改写或删除的文件会先原样备份到 {os.path.join(project.state_dir, 'rollback-backup')}。子模块内部不在回滚范围内。")
         print("确认后加 --yes 重新执行。")
         sys.exit(3)
 
     write_baton_gitignore(project)
-    top = git_top(root)
-    pre_ref, err = try_checkpoint(root, args.task, f"pre-rollback-{stamp(fmt='%Y%m%d-%H%M%S')}")
+    top = store.top
+    pre_ref, err = try_checkpoint(project, args.task, f"pre-rollback-{stamp(fmt='%Y%m%d-%H%M%S')}", st=st)
     if err:
         die(f"回滚前的状态没能存下来，已放弃回滚：{err}")
-    pre = git(root, "rev-parse", pre_ref).strip()
-    backup_dir = project.p("rollback-backup", os.path.basename(pre_ref))
-    entries = diff_tree_entries(root, pre, target)
+    pre = store.git("rev-parse", pre_ref).strip()
+    backup_dir = os.path.join(project.state_dir, "rollback-backup", os.path.basename(pre_ref))
+    entries = diff_tree_entries(store, pre, target)
     gitlinks = set()
     for tree in (pre, target):
-        for line in git(top, "ls-tree", "-r", "-z", tree).split("\0"):
+        for line in store.git("ls-tree", "-r", "-z", tree, cwd=top).split("\0"):
             if line.startswith("160000 "):
                 gitlinks.add(line.split("\t", 1)[1])
+    nested_cache = {}
+
+    def nested_owner(path):
+        """The nested project (its own baton.json or .baton/) that owns path, if any."""
+        d = os.path.dirname(os.path.join(top, path))
+        chain = []
+        while d.startswith(root + os.sep):
+            if d in nested_cache:
+                found = nested_cache[d]
+                break
+            chain.append(d)
+            if is_project_dir(d):
+                found = d
+                break
+            d = os.path.dirname(d)
+        else:
+            found = None
+        for c in chain:
+            nested_cache[c] = found
+        return found
+
+    tracked = store.user_tracked() if store.kind == "shadow" else set()
+    exclusion_candidates = []
+    for src, dst, status_, path in entries:
+        if status_ not in ("A", "M", "T") or "160000" in (src, dst) or _under(path, gitlinks):
+            continue
+        owner = nested_owner(path)
+        if not owner and not _leading_symlink(top, path):
+            exclusion_candidates.append(path)
+    excluded_set = shadow_excluded_many(store, exclusion_candidates, tracked)
     deletes, writes, skipped = [], [], []
     for src, dst, status_, path in entries:
+        owner = nested_owner(path)
         if "160000" in (src, dst) or _under(path, gitlinks):
             skipped.append(f"{path}（子模块）")
+        elif owner:
+            skipped.append(f"{path}（属于嵌套项目 {os.path.relpath(owner, root)}）")
         elif _leading_symlink(top, path):
             skipped.append(f"{path}（路径经过符号链接）")
         elif status_ == "D":
             deletes.append(path)
         elif status_ in ("A", "M", "T"):
-            writes.append(path)
+            if path in excluded_set:
+                skipped.append(f"{path}（已排除）")
+            else:
+                writes.append(path)
 
     # 0. back up every existing path that will be deleted or overwritten, before changing anything
-    backed, seen = [], set()
+    backed, seen, backup_manifest = [], set(), []
     try:
         for path in deletes + writes:
             full = os.path.join(top, path)
@@ -1565,7 +2492,7 @@ def cmd_rollback(project, args):
                 if (st_.st_dev, st_.st_ino) in seen:
                     continue  # same file under another name (case-insensitive disk)
                 seen.add((st_.st_dev, st_.st_ino))
-                backed.append(_backup(top, full, backup_dir))
+                backed.append(_backup(top, full, backup_dir, backup_manifest))
     except Exception as e:  # noqa: BLE001
         die(f"备份要改动的文件时出错，已放弃回滚，工作区没有改动：{e}")
 
@@ -1584,17 +2511,14 @@ def cmd_rollback(project, args):
             for i in range(1, len(parts)):
                 full_lead = os.path.join(top, "/".join(parts[:i]))
                 if os.path.islink(full_lead) or (os.path.lexists(full_lead) and not os.path.isdir(full_lead)):
-                    backed.append(_backup(top, full_lead, backup_dir))
+                    backed.append(_backup(top, full_lead, backup_dir, backup_manifest))
                     os.unlink(full_lead)
                     break
             full = os.path.join(top, path)
             if os.path.isdir(full) and not os.path.islink(full):
                 if os.path.lexists(os.path.join(full, ".git")):
                     raise RuntimeError(f"{path} 是一个嵌套的 git 仓库，不会移动它")
-                dest = os.path.join(backup_dir, path)
-                if os.path.lexists(dest):
-                    raise RuntimeError(f"备份目标已存在：{dest}")
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                dest = _backup_destination(backup_dir, path, backup_manifest)
                 shutil.move(full, dest)
                 backed.append(dest)
         # 3. write the target versions through a throwaway index (git applies modes and filters);
@@ -1604,18 +2528,20 @@ def cmd_rollback(project, args):
             os.close(fd)
             os.remove(tmp_index)
             try:
-                env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
-                git(top, "read-tree", target, env=env)
+                env = {"GIT_INDEX_FILE": tmp_index}
+                store.git("read-tree", target, env=env, cwd=top)
                 attrs = [p for p in writes if p.split("/")[-1] == ".gitattributes"]
                 rest = [p for p in writes if p not in attrs]
                 for batch in (attrs, rest):
                     if batch:
-                        git(top, "checkout-index", "-f", "-z", "--stdin", env=env,
+                        store.git("checkout-index", "-f", "-z", "--stdin", env=env, cwd=top,
                             input_text="".join(p + "\0" for p in batch))
             finally:
                 if os.path.exists(tmp_index):
                     os.remove(tmp_index)
             written = writes
+        if backup_manifest:
+            write_json(os.path.join(backup_dir, "manifest.json"), {"case_conflicts": backup_manifest})
     except Exception as e:  # noqa: BLE001
         msg = f"回滚中途出错：{e}\n回滚前的状态在 {pre_ref}，可以用 baton rollback {args.task} {pre_ref} --yes 恢复。"
         if backed:
@@ -1626,9 +2552,13 @@ def cmd_rollback(project, args):
         print(f"改动前的文件原样备份在 {backup_dir}（{len(backed)} 项）。")
     if skipped:
         print("未处理：" + "，".join(skipped[:20]))
+    nested = nested_project_dirs_for_code(root)
+    if nested and not any("属于嵌套项目" in item for item in skipped):
+        print(f"另有 {len(nested)} 个嵌套项目，回滚不涉及（属于嵌套项目 " + "、".join(nested) + "）")
     if gitlinks:
         print("注意：项目里有子模块或嵌套仓库，它们内部的改动不在回滚范围内。")
-    staged = git(root, "diff", "--cached", "--name-only", "--", ".", *EXCLUDE, check=False).split()
+    staged = [x for x in git(root, "diff", "--cached", "--name-only", "-z", "--", ".", *EXCLUDE,
+                             check=False).split("\0") if x] if is_git(root) else []
     if staged:
         print("注意：暂存区里还有这些改动（回滚不碰暂存区）：" + "，".join(staged[:20])
               + "。如需丢弃，问过用户后运行 git restore --staged -- <路径>")
@@ -1637,7 +2567,7 @@ def cmd_rollback(project, args):
 def cmd_list(project, args):
     project.require_init()
     for task in project.tasks():
-        st = read_json(project.state_path(task), {}) or {}
+        st = project.read_state(task, {}) or {}
         leg = current_leg(st) if st else None
         print(f"{task:<24} {st.get('status', 'draft'):<8} 轮次 {len(st.get('legs', []))}"
               + (f"  最新：{leg['status']} @ {stamp(leg['started_at'])}" if leg else ""))
@@ -1645,16 +2575,31 @@ def cmd_list(project, args):
 
 def cmd_config(project, args):
     cfg = project.config
-    judge = cfg["judge"]
+    conductor = cfg["conductor"]
+    monitor = cfg["monitor"]
     ex = cfg["executor"]
-    print(f"BATON::CONFIG judge={judge['model']} executor={ex['model']} effort={ex['reasoning_effort']}")
+    print(f"BATON::CONFIG judge={conductor['model']} executor={ex['model']} effort={ex['reasoning_effort']}"
+          f" conductor={conductor['model']} backend={ex['backend']} project_id={project.project_id} monitor={monitor['model']} mode={cfg['mode']}")
+    if cfg.get("mode") == "lean":
+        print(LEAN_HINT)
+    if project.needs_backend_migration:
+        print("迁移提示：旧项目继续使用 codex；v2 默认执行者将改为 Hermes，第 4 阶段提供 baton init --migrate。",
+              file=sys.stderr if args.json else sys.stdout)
     if args.json:
         print(json.dumps(cfg, ensure_ascii=False, indent=2))
         return
-    print(f"judge.model：{judge['model']}")
-    print(f"judge.council_for_major_decisions：{judge.get('council_for_major_decisions')}")
-    for key in ("model", "reasoning_effort", "service_tier", "disable_fast_mode", "network_access", "sandbox"):
+    print(f"conductor.model：{conductor['model']}")
+    print(f"conductor.council_for_major_decisions：{conductor['council_for_major_decisions']}")
+    print(f"judge.council_for_major_decisions（v1 旧名，等同上一行）：{conductor['council_for_major_decisions']}")
+    for key in ("model", "reasoning_effort", "final_reasoning_effort", "timeout_minutes"):
+        print(f"monitor.{key}：{monitor.get(key)}")
+    if project.judge_renamed_to_monitor:
+        print("迁移提示：项目层的 judge 节已按 v2 早期草案改名为 monitor。")
+    for key in ("backend", "model", "reasoning_effort", "service_tier", "disable_fast_mode", "network_access", "sandbox"):
         print(f"executor.{key}：{ex.get(key)}")
+    print(f"项目目录：{project.root}")
+    print(f"项目 id：{project.project_id}")
+    print(f"项目外状态目录：{project.state_dir}")
     print(f"supervision.test_command：{cfg['supervision'].get('test_command', '')}")
     print("配置层：")
     for path, exists in project.config_paths():
@@ -1714,7 +2659,8 @@ def cmd_doctor(project, args):
     ex = cfg["executor"]
     baton_state = "存在" if os.path.exists(project.baton_config_path) else "缺失"
     line("OK" if baton_state == "存在" else "WARN",
-         f"judge 模型：{cfg['judge']['model']}；baton.json：{baton_state}（{project.baton_config_path}）")
+         f"conductor 模型：{cfg['conductor']['model']}；monitor 模型：{cfg['monitor']['model']}；"
+         f"baton.json：{baton_state}（{project.baton_config_path}）")
     cache = read_json(os.path.expanduser("~/.codex/models_cache.json"), {})
     models = cache.get("models", cache) if isinstance(cache, dict) else cache
     model = next((m for m in models or [] if isinstance(m, dict) and m.get("slug") == ex["model"]), None)
@@ -1746,7 +2692,12 @@ def cmd_doctor(project, args):
          "council skill：" + ("已安装" if os.path.exists(council) else f"未安装（{council_dir()}，./install.sh --council）"))
     if os.path.exists(council):
         line(*council_check())
-    line("OK" if is_git(project.root) else "WARN", f"项目 {project.root}：" + ("git 仓库" if is_git(project.root) else "非 git，无回滚点"))
+    top = git_repo_top(project.root)
+    line("OK", f"项目 {project.root}（id {project.project_id}）："
+         + (f"在 git 仓库里，git 顶层 {top}" if top else "不是 git 仓库"))
+    shadow_ok = os.path.isfile(os.path.join(project.snap_git_dir, "HEAD"))
+    line("OK" if shadow_ok else "WARN",
+         f"快照：影子仓库 {project.snap_git_dir}" + ("" if shadow_ok else "（尚未建立，baton init 会建立）"))
     line("OK" if os.path.isdir(project.dir) else "WARN", ".baton/：" + ("已初始化" if os.path.isdir(project.dir) else "未初始化（baton init）"))
     sl = statusline_report(project).splitlines()[0]
     good = "已安装 Baton 版本" in sl
@@ -1758,10 +2709,13 @@ def cmd_doctor(project, args):
 
 def main():
     ap = argparse.ArgumentParser(prog="baton", description="Claude 指挥、Codex 执行的工作流工具")
-    ap.add_argument("--root", help="项目目录（默认：当前目录所在 git 仓库根）")
+    ap.add_argument("--root", help="项目目录（默认：从当前目录往上第一个含 baton.json 的目录，不越过 git 根）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("init", help="在项目里创建 .baton/，并配置带 Codex 额度的 statusline")
     s.add_argument("--no-statusline", action="store_true", help="不改项目的 statusline")
+    s.add_argument("--accept-boundary", action="store_true", help="确认项目目录可以是 git 顶层下的子目录")
+    s.add_argument("--relink", action="store_true", help="项目目录换过位置或名字时，把原来的项目外状态接过来")
+    s.add_argument("--fresh", action="store_true", help="复制项目或原状态不存在时，开始新的项目外状态")
     s = sub.add_parser("statusline", help="项目 statusline 的 Codex 额度行")
     s.add_argument("action", nargs="?", default="status", choices=["install", "uninstall", "status"])
     s.add_argument("--force", action="store_true", help="settings.local.json 被 git 跟踪或指向项目外时也安装")
@@ -1796,7 +2750,7 @@ def main():
     s.add_argument("task")
     s = sub.add_parser("diff", help="相对回滚点的改动")
     s.add_argument("task")
-    s.add_argument("--since", default="leg", help="base / leg / tick / report / 任意 ref")
+    s.add_argument("--since", default="leg", help="base / leg / tick / report / baton refs 列出的回滚点")
     s.add_argument("--stat", action="store_true")
     s = sub.add_parser("rollback", help="把工作区文件恢复到某个回滚点（先自动保存当前状态）")
     s.add_argument("task")
@@ -1813,7 +2767,18 @@ def main():
     s.add_argument("task")
     s.add_argument("n")
     args = ap.parse_args()
-    project = Project(args.root or find_root(os.getcwd()))
+    home = os.environ.get("BATON_HOME")
+    if home and not os.path.isabs(os.path.expanduser(home)):
+        # the detached runner starts in the project dir: pin a relative BATON_HOME before it inherits it
+        os.environ["BATON_HOME"] = os.path.abspath(os.path.expanduser(home))
+    root = canonical_dir(args.root) if args.root else find_project_dir(os.getcwd(), legacy=args.cmd != "init")
+    project = Project(root)
+    if args.cmd not in ("init", "quota", "doctor", "config", "statusline"):
+        project.require_init()
+    if args.cmd not in ("init", "quota") and is_initialized(project.root):
+        if not project.recorded_id():
+            project.record_id()
+        project.check_identity(warn_only=args.cmd in ("doctor", "config"))
     handler = {
         "init": cmd_init, "statusline": cmd_statusline, "new": cmd_new, "start": cmd_start,
         "resume": cmd_resume, "steer": cmd_steer, "wait": cmd_wait, "status": cmd_status,

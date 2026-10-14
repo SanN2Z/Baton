@@ -1,10 +1,18 @@
 {
   "_comment": "Baton defaults. Configuration deep-merges in this order: this skill config.json, <project>/.baton/config.json, then <project>/baton.json. Project quota.* is ignored; quota is per account and read from this file only. BATON_QUOTA_WARN_PERCENT and BATON_DESKTOP_NOTIFY=0 override it per shell.",
-  "judge": {
+  "conductor": {
     "model": "opus",
-    "council_for_major_decisions": true
+    "council_for_major_decisions": true,
+    "reasoning_effort": null
+  },
+  "monitor": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": null,
+    "final_reasoning_effort": null,
+    "timeout_minutes": 40
   },
   "executor": {
+    "backend": "codex",
     "model": "gpt-6.1-sol",
     "reasoning_effort": "xhigh",
     "service_tier": "default",
@@ -13,9 +21,18 @@
     "network_access": false,
     "extra_config": []
   },
+  "mode": "standard",
   "supervision": {
     "interval_minutes": 30,
     "max_unsupervised_minutes": 70,
+    "first_check_minutes": 10,
+    "max_check_minutes": 60,
+    "unhandled_stop_minutes": 30,
+    "alerts": {
+      "delete_ratio": 3,
+      "stall_minutes": 20,
+      "repeat_fail": 3
+    },
     "test_command": ""
   },
   "quota": {
