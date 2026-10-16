@@ -24,6 +24,30 @@ v2 由 v1 的 Baton 自举开发，带 239 个单元测试和 5 个连接真实 
 
 记忆由 mem0、本地 Ollama 和 `baton-qwen3-embed:latest` 提供。Ollama 离线时会退回关键词检索并记录原因。
 
+## 两种模式
+
+`baton.json` 里的 `mode` 取 `standard`（默认）或 `lean`。lean 是极限省 token 的模式，只保留一种交互，executor 把活干完，conductor 审一次。
+
+| | standard | lean |
+|---|---|---|
+| executor | gpt-5.6-luna xhigh，卡住时升级到 gpt-6.1-sol | gpt-5.6-luna medium，不升级 |
+| conductor 思考深度 | 不限 | medium（`baton` 管不了主会话，事件里会提示用户调整） |
+| monitor 与监督简报 | 每份汇报一份，裁决须逐条回应 | 不设 monitor，不生成卷宗 |
+| 轮中监督 | 规则信号加 monitor 方向检查，DRIFT/BREAKING 叫醒 conductor | 关闭，规则信号只附在轮末事件里 |
+| 汇报与决策请求 | 大修改交汇报、遇到决策停下等裁决 | 一轮做到底，自己拿主意写进 log，做完交一份汇报 |
+| conductor 出场 | 每份汇报、决策请求和偏离事件 | 只在 done、blocked、failed 时审一次 |
+| 记忆 | 推送、monitor 提炼候选、定期整理回合 | 照常推送，候选由 conductor 审查时核准，没有整理回合 |
+
+两种模式都保留不花模型 token 的部分，包括冻结与 60 秒核对、baton 亲跑验证、影子仓库和回滚点、容量自动重试、额度提醒。切到 lean 只要在项目根的 `baton.json` 写一行：
+
+```json
+{ "mode": "lean" }
+```
+
+项目层里显式写的键仍然优先，比如在 lean 下单独把 `executor.reasoning_effort` 设成 `high` 也会生效。
+
+手写 `baton.json` 时记得带上 `"executor": {"backend": "hermes"}`。没有这个键的文件按 v1 兼容规则走 codex 后端；`baton init` 生成的文件已经写好了。
+
 ## 安装
 
 需要 Claude Code、Python 3.9+、git、已登录的 Codex CLI，以及 Hermes。
