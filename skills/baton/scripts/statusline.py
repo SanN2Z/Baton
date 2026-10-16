@@ -9,6 +9,7 @@ finally the user's ~/.claude/settings.json. It receives the same stdin JSON.
 The Codex line never blocks: it renders cached data and refreshes in the background.
 """
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -129,6 +130,65 @@ def codex_line(session):
     return line
 
 
+def _project_id(project_dir):
+    real = os.path.realpath(project_dir)
+    return os.path.basename(real) + "-" + hashlib.sha1(os.fsencode(real)).hexdigest()[:8]
+
+
+def _running_round(session):
+    """Read only the small Baton state needed for the optional runtime line."""
+    project_dir = project_dir_of(session)
+    candidates = []
+    local = os.path.join(project_dir, ".baton", "tasks")
+    candidates.append(local)
+    home = os.environ.get("BATON_HOME") or "~/.baton"
+    if "${" not in home:
+        home = os.path.abspath(os.path.expanduser(home))
+        candidates.append(os.path.join(home, "projects", _project_id(project_dir), "tasks"))
+    for tasks_dir in candidates:
+        try:
+            names = sorted(os.listdir(tasks_dir))
+        except OSError:
+            continue
+        for task in names:
+            path = os.path.join(tasks_dir, task, "state.json")
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    state = json.load(stream)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            legs = state.get("legs") or []
+            if not legs:
+                continue
+            leg = legs[-1]
+            monitor = leg.get("monitor") or {}
+            if leg.get("status") != "running" and monitor.get("status") != "running":
+                continue
+            model = leg.get("model") or (leg.get("executor") or {}).get("model") or "?"
+            result = {"task": task, "leg": leg.get("n", len(legs)), "model": model,
+                      "escalated": bool(leg.get("escalated")),
+                      "monitor": monitor.get("status") == "running",
+                      "capacity_wait": leg.get("capacity_wait")}
+            return result
+    return None
+
+
+def runtime_line(session):
+    info = _running_round(session)
+    if not info:
+        return None
+    model = str(info["model"]) + ("（升级）" if info.get("escalated") else "")
+    parts = [f"Baton {info['task']}·第{info['leg']}轮·{model}",
+             "monitor 运行中" if info.get("monitor") else "monitor 未运行"]
+    wait = info.get("capacity_wait")
+    if isinstance(wait, dict):
+        remaining = max(0, int(float(wait.get("next_retry_at", time.time())) - time.time()))
+        parts.append(f"容量重试等待 {remaining // 60}m")
+    return " │ ".join(parts)
+
+
 def main():
     if os.environ.get(GUARD):
         return  # invoked from inside our own base command: a resolution loop, print nothing
@@ -152,6 +212,12 @@ def main():
         lines.append(codex_line(session))
     except Exception:
         lines.append("Codex 额度：读取失败")
+    try:
+        runtime = runtime_line(session)
+        if runtime:
+            lines.append(c(runtime, "35"))
+    except Exception:
+        pass
     sys.stdout.write("\n".join(lines) + "\n")
 
 

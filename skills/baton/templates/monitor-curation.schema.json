@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "operations"],
+  "properties": {
+    "summary": {"type": "string", "maxLength": 600},
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "op", "targets", "kind", "text", "source", "anchors", "reason"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^K[1-9][0-9]*$"},
+          "op": {"type": "string", "enum": ["merge", "supersede", "pin", "unpin", "retire"]},
+          "targets": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^M[0-9]*[1-9][0-9]*$"}},
+          "kind": {"type": "string", "enum": ["command", "convention", "pitfall", "precedent", "map", "event"]},
+          "text": {"type": "string"},
+          "source": {"type": "string"},
+          "anchors": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string"}},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}

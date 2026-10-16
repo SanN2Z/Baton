@@ -1,38 +1,27 @@
-# 审阅大修改汇报与最终验收
+# 审阅监督简报与最终验收
 
-## REPORT：审阅汇报
+## 汇报后的裁决
 
-1. 读事件里给出的汇报 HTML。
-2. 核对汇报与事实：
-   - `baton diff <task> --since report --stat` 对照汇报的改动清单。`--since report` 的起点是上一次交汇报那一轮的终点（没有就是任务起点），中间经过决策、纠偏的轮次都算在内；REPORT 事件里「自上次汇报以来」一行是同一个统计。diff 里的每个文件都应出现在汇报中，汇报没提到的文件要追问。行数以 baton 的统计为准，执行者在沙箱里只能拿到相对 HEAD 的累计数和新文件的 `wc -l`，数字对不上不算问题。
-   - `baton diff <task> --since report` 读关键 diff，先看汇报里「请指挥重点审阅」列出的位置。
-   - 自己跑一遍验证命令，结果应与汇报一致。
-3. 判断：是否推进了简报目标、满足相应验收标准；设计取舍是否站得住；有没有范围外改动、接口破坏、测试被删弱；风险一节是否如实。
-4. 写审阅到 `.baton/reviews/R<NNN>-review.md`（编号与汇报相同）：
+1. 先读 `baton wait <task>` 给出的监督简报和 `baton diff <task> --since report`。简报是独立证据；汇报 HTML 只是 executor 的当事人陈述。
+2. 逐条回应简报里的 F1、F2……，包括 monitor 对「申辩」引用证据的核对结果。裁决文件用 `baton-verdict` fenced JSON，例如：
 
-   ```markdown
-   # R<NNN> 审阅
-
-   - 结论：APPROVE / REVISE / ROLLBACK
-   - 核对：diff 与汇报是否一致；验证命令及结果
-
-   ## 问题
-   按严重程度排列，每条给出 文件:行号、问题、期望的改法。没有就写「无」。
-
-   ## 给执行者的指令
-   APPROVE：下一步做什么（可直接沿用汇报里的下一步）。
-   REVISE：逐条列出必须修改的点，修完后是否需要再交汇报。
+   ````markdown
+   ```baton-verdict
+   {"conclusion":"APPROVE","findings":{"F1":{"decision":"reject","reason":"验证结果与章程一致"}}}
    ```
+   ````
 
-5. 处理：
-   - APPROVE / REVISE：`baton resume <task> .baton/reviews/R<NNN>-review.md --kind 审阅`，后台 `baton wait <task>`。
-   - ROLLBACK：先告诉用户原因和回滚点，用户同意后 `baton rollback <task> <ref> --yes`，再写新的指令续跑。
-6. 告诉用户：审阅结论、主要理由、汇报路径。
+   `conclusion` 取 `APPROVE`、`REVISE` 或 `ROLLBACK`；每条 finding 都要有 `adopt` 或 `reject`（也可用 `--memory as-advised` 核准记忆建议）。
+3. 用 `baton rule <task> <dossier> <verdict-file>` 入账。只接受绑定当前卷宗和最新监督简报哈希的裁决；漏掉一条 finding 会被拒绝。对同一卷宗重裁决必须加 `--rerule`，旧裁决仍留在账本。
+4. `APPROVE` 或终审 `ACCEPT` 后，用 `baton resume <task> --verdict <dossier>` 续跑；普通回复也必须先有裁决。裁决为 `REVISE` 时，executor 下一份汇报开头写「修订自 R003」，把同一事项串起来。连续三次 REVISE 或升级轮仍未通过，停下交用户。
 
-## DONE：最终验收
+## 终审与 close
 
-1. `baton diff <task> --since base --stat` 和关键 diff，看整个任务的改动。
-2. 对照简报的验收标准逐条检查，验证命令自己跑。
-3. 写 `.baton/reviews/<task>-final.md`：每条验收标准是否满足、验证结果、遗留问题、回滚点（`baton refs <task>`）。
-4. 有不满足的验收标准：写指令后 `baton resume <task> <文件> --kind 审阅`，继续守候。
-5. 全部满足：向用户汇报完成了什么、验证结果、遗留问题、改动统计。不自行 git commit 或 push，用户要求时再做。
+1. executor 交 `done` 后，读取 `task-final` 监督简报，写 `ACCEPT` 或 `REVISE` 裁决并用 `baton rule` 入账。
+2. 只有最新终审卷宗绑定 `ACCEPT`、Baton 亲跑的验收验证全部通过、终点快照和裁决之后代码没有变化时，运行 `baton close <task>`。close 会重新建快照，并列出被驳回的偏离。
+3. `ROLLBACK`：把原因和回滚点告知用户；用户同意后才运行 `baton rollback <task> <ref> --yes`，不同意就按 `REVISE` 续跑。
+4. `VIOLATION`：读简报后只能选择 `REVERT`、`ADOPT` 或 `ASK_USER`。REVERT 先 `baton restore-frozen`；ADOPT 由用户在自己的终端运行带 `--user-approved` 的 `baton amend --adopt`；ASK_USER 停住等待用户。
+
+## 记忆核准
+
+`baton rule` 默认按 monitor 建议核准候选；不同意时用 `--memory none` 或在裁决里逐条改写。核准成功后才会追加台账，之后再 `baton resume`。不要直接编辑 ledger、reviews 或历史卷宗。

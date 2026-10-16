@@ -1,7 +1,7 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "summary", "artifact", "change_size"],
+  "required": ["status", "summary", "artifact", "change_size", "memory_used"],
   "properties": {
     "status": {
       "type": "string",
@@ -20,6 +20,11 @@
       "type": "string",
       "enum": ["none", "minor", "major"],
       "description": "Size of the code changes made in this leg"
+    },
+    "memory_used": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Memory record identifiers used during this leg"
     }
   }
 }

@@ -129,6 +129,7 @@ class V2StateTests(unittest.TestCase):
         root = Path(self.env_tmp.name) / "project"
         (root / ".baton" / "tasks" / "task").mkdir(parents=True)
         (root / ".baton" / "tasks" / "task" / "brief.md").write_text("filled", encoding="utf-8")
+        (root / "baton.json").write_text(json.dumps({"executor": {"backend": "codex"}}), encoding="utf-8")
         project = baton.Project(str(root))
 
         class FakeProcess:

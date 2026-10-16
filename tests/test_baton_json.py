@@ -70,8 +70,8 @@ class BatonJsonTests(unittest.TestCase):
         cfg = project.config
         self.assertEqual(cfg["conductor"]["model"], "opus")
         self.assertTrue(cfg["conductor"]["council_for_major_decisions"])
-        self.assertEqual(cfg["executor"]["backend"], "codex")
-        self.assertEqual(cfg["executor"]["model"], "gpt-6.1-sol")
+        self.assertEqual(cfg["executor"]["backend"], "hermes")
+        self.assertEqual(cfg["executor"]["model"], "gpt-5.6-luna")
         self.assertEqual(cfg["monitor"]["model"], "gpt-5.6-sol")
 
     def test_invalid_baton_json_is_an_error(self):
@@ -94,6 +94,7 @@ class BatonJsonTests(unittest.TestCase):
     def test_init_creates_baton_json_without_overwriting(self):
         tmp, root, project = self.project()
         self.addCleanup(tmp.cleanup)
+        self.write_json(root / ".baton" / "config.json", {"executor": {"backend": "codex"}})
         baton.cmd_init(project, Namespace(no_statusline=True))
         path = root / "baton.json"
         self.assertTrue(path.exists())
@@ -250,7 +251,7 @@ class BatonJsonTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             baton.cmd_config(project, Namespace(json=False))
         summary = out.getvalue()
-        self.assertTrue(summary.startswith("BATON::CONFIG judge=sonnet executor=gpt-6.1-sol effort=xhigh conductor=sonnet backend=codex project_id="))
+        self.assertTrue(summary.startswith("BATON::CONFIG judge=sonnet executor=gpt-5.6-luna effort=xhigh conductor=sonnet backend=codex project_id="))
         for expected in ("conductor.model：sonnet", "monitor.model：gpt-5.6-sol", "monitor.reasoning_effort：None",
                          "monitor.final_reasoning_effort：None", "monitor.timeout_minutes：40", "executor.backend：codex",
                          os.path.realpath(str(root)), project.project_id, project.state_dir,
@@ -260,7 +261,7 @@ class BatonJsonTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             baton.cmd_config(project, Namespace(json=True))
         marker, payload = out.getvalue().split("\n", 1)
-        self.assertTrue(marker.startswith("BATON::CONFIG judge=sonnet executor=gpt-6.1-sol effort=xhigh conductor=sonnet backend=codex project_id="))
+        self.assertTrue(marker.startswith("BATON::CONFIG judge=sonnet executor=gpt-5.6-luna effort=xhigh conductor=sonnet backend=codex project_id="))
         cfg = json.loads(payload)
         self.assertEqual(cfg["conductor"]["model"], "sonnet")
         self.assertNotIn("judge", cfg)
@@ -291,6 +292,7 @@ class BatonJsonTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.write_json(root / ".baton/config.json", {
             "judge": {"model": "haiku", "council_for_major_decisions": False},
+            "executor": {"backend": "codex"},
         })
         with contextlib.redirect_stdout(io.StringIO()):
             baton.cmd_init(project, Namespace(no_statusline=True))

@@ -1,5 +1,11 @@
 # 任务简报：{{TASK}}
 
+```baton-scope
+{"allow": ["src/", "tests/"], "deny": ["data/"], "acceptance": ["tests/acceptance/"], "frozen": [], "verify": "auto"}
+```
+
+范围块必须放在简报开头附近。四个路径键都是相对项目目录的路径或 glob；`verify` 可写 `auto`（默认）或 `none`。`acceptance`、`frozen` 和测试配置会在任务开始时冻结，之后改动会停住执行者。
+
 ## 目标
 （待填）一两句话说明要做成什么，以及为什么做。
 

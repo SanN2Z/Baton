@@ -29,17 +29,44 @@ install_skill() {
     STATUS=1
     return
   fi
+  if [[ -L "${dst}" ]]; then
+    local old_skill
+    old_skill=$(readlink "${dst}" 2>/dev/null || true)
+    if [[ "${old_skill}" != "${SKILL_SRC}" ]]; then
+      echo "更新软链接：${dst}（${old_skill} -> ${SKILL_SRC}）"
+    fi
+  else
+    echo "skill   ${dst} -> ${SKILL_SRC}"
+  fi
   ln -sfn "${SKILL_SRC}" "${dst}"
-  echo "skill   ${dst} -> ${SKILL_SRC}"
-  if [[ -e "${cli}" || -L "${cli}" ]] && [[ "$(readlink "${cli}" 2>/dev/null || true)" != */skills/baton/bin/baton ]]; then
+  if [[ -L "${cli}" ]]; then
+    local old_cli
+    old_cli=$(readlink "${cli}" 2>/dev/null || true)
+    if [[ "${old_cli}" != "${SKILL_SRC}/bin/baton" ]]; then
+      echo "更新软链接：${cli}（${old_cli} -> ${SKILL_SRC}/bin/baton）"
+    fi
+    ln -sfn "${SKILL_SRC}/bin/baton" "${cli}"
+    echo "CLI     ${cli} -> ${SKILL_SRC}/bin/baton"
+  elif [[ -e "${cli}" ]]; then
     echo "冲突：${cli} 是另一个同名程序。skill 里的 baton 命令会调用到它，请先改名或移走，再重新运行 install.sh" >&2
     STATUS=1
   else
     ln -sfn "${SKILL_SRC}/bin/baton" "${cli}"
-    echo "CLI     ${cli}"
+    echo "CLI     ${cli} -> ${SKILL_SRC}/bin/baton"
   fi
   case ":${PATH}:" in *":${BIN_DIR}:"*) ;; *) echo "提示：${BIN_DIR} 不在 PATH 中，请加入 shell 配置" ;; esac
   command -v codex >/dev/null || echo "提示：没有找到 codex CLI（npm i -g @openai/codex，然后 codex login）"
+  if command -v ollama >/dev/null; then
+    echo "Ollama  已找到：$(command -v ollama)"
+  else
+    echo "提示：没有找到 Ollama，请安装并启动 Ollama，再准备 qwen3-embedding:0.6b"
+  fi
+  if command -v hermes >/dev/null; then
+    echo "Hermes  已找到：$(command -v hermes)"
+  else
+    echo "提示：没有找到 hermes，请安装 Hermes 并创建 baton-exec-v2 profile"
+  fi
+  echo "下一步（不会自动执行）：baton memory install；baton init"
 }
 
 install_council() {

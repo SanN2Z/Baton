@@ -57,6 +57,9 @@ class Base(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def init(self, proj, **kw):
+        path = Path(proj) / "baton.json"
+        if not path.exists():
+            path.write_text(json.dumps({"executor": {"backend": "codex"}}), encoding="utf-8")
         project = baton.Project(str(proj))
         out = quiet(baton.cmd_init, project, Namespace(no_statusline=True, accept_boundary=True, **kw))
         return project, out
@@ -471,6 +474,9 @@ class CliEndToEndTests(Base):
     """The real CLI with a fake codex, in a ~/yuzz-like layout; the user's repo must not change."""
 
     def test_full_cycle_leaves_the_user_repo_untouched(self):
+        self.assertFalse((ROOT / "a.py").exists(), "仓库根目录不应有端到端试验的 a.py")
+        self.addCleanup(lambda: self.assertFalse(
+            (ROOT / "a.py").exists(), "端到端试验写入了 Baton 仓库根目录"))
         bindir = self.tmp / "bin"
         write(bindir / "codex", textwrap.dedent('''\
             #!/usr/bin/env python3
@@ -480,6 +486,9 @@ class CliEndToEndTests(Base):
                 sys.exit(2)
             out = args[args.index("-o") + 1]
             sys.stdin.read()
+            if "--ignore-user-config" in args:
+                json.dump({"summary": "monitor ok", "recommendation": "APPROVE", "findings": [], "memory_advice": []}, open(out, "w"))
+                sys.exit(0)
             print(json.dumps({"type": "thread.started", "thread_id": "fake-thread"}), flush=True)
             with open("a.py", "a") as fh:
                 fh.write("edited = True\\n")
@@ -499,6 +508,7 @@ class CliEndToEndTests(Base):
         git(outer, "add", "README.md")
         proj = outer / "proj"
         write(proj / "a.py", "a = 1\n")
+        write(proj / "baton.json", json.dumps({"executor": {"backend": "codex"}}))
         env = clean_env(HOME=str(self.tmp / "home"), BATON_HOME=str(self.tmp / "state"),
                         PATH=str(bindir) + os.pathsep + os.environ["PATH"], BATON_DESKTOP_NOTIFY="0")
 
@@ -518,7 +528,8 @@ class CliEndToEndTests(Base):
         b("init", "--no-statusline", rc=1)
         b("init", "--no-statusline", "--accept-boundary")
         b("new", "t")
-        write(proj / ".baton" / "tasks" / "t" / "brief.md", "# 任务简报：t\n\n改 a.py\n")
+        write(proj / ".baton" / "tasks" / "t" / "brief.md",
+              '```baton-scope\n{"allow": [], "deny": [], "acceptance": [], "frozen": [], "verify": "none"}\n```\n# 任务简报：t\n\n改 a.py\n')
         b("start", "t")
         self.assertIn("BATON::EVENT REPORT", b("wait", "t"))
         self.assertIn("a.py", b("status", "t"))
@@ -528,6 +539,7 @@ class CliEndToEndTests(Base):
         b("rollback", "t", "refs/baton/t/base", "--yes")
         self.assertEqual((proj / "a.py").read_text(), "a = 1\n")
         self.assertEqual(fingerprint(), before)
+        self.assertFalse((ROOT / "a.py").exists(), "端到端试验只能写临时项目")
 
 
 if __name__ == "__main__":

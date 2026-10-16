@@ -1,0 +1,50 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "recommendation", "findings", "memory_advice"],
+  "properties": {
+    "summary": {"type": "string"},
+    "recommendation": {"type": "string", "enum": ["APPROVE", "REVISE", "ROLLBACK", "ACCEPT", "REVERT", "ADOPT", "ASK_USER"]},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "severity", "description", "evidence", "rule_source"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^F[1-9][0-9]*$"},
+          "category": {"type": "string", "enum": ["charter_deviation", "precedent_or_message_deviation", "acceptance_gap", "breaking_signal", "out_of_scope", "missing_record", "self_report_mismatch"]},
+          "severity": {"type": "string", "enum": ["blocking", "note"]},
+          "description": {"type": "string"},
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["location", "excerpt"],
+              "properties": {"location": {"type": "string"}, "excerpt": {"type": "string"}}
+            }
+          },
+          "rule_source": {"type": "string"}
+        }
+      }
+    },
+    "memory_advice": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "action", "kind", "text", "source", "anchors", "reason"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^(C[1-9][0-9]*|M[0-9]*[1-9][0-9]*|new)$"},
+          "action": {"type": "string", "enum": ["approve", "rewrite", "reject", "new", "restore", "retire"]},
+          "kind": {"type": "string", "enum": ["command", "convention", "pitfall", "precedent", "map", "event"]},
+          "text": {"type": "string"},
+          "source": {"type": "string"},
+          "anchors": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string"}},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}

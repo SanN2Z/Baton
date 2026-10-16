@@ -58,6 +58,9 @@ class ShadowRepoTests(unittest.TestCase):
         return outer, proj
 
     def init(self, proj):
+        path = Path(proj) / "baton.json"
+        if not path.exists():
+            path.write_text(json.dumps({"executor": {"backend": "codex"}}), encoding="utf-8")
         project = baton.Project(str(proj))
         out = quiet(baton.cmd_init, project, Namespace(no_statusline=True, accept_boundary=True))
         return project, out
@@ -182,7 +185,8 @@ class ShadowRepoTests(unittest.TestCase):
         project, _ = self.init(proj)
         task_dir = proj / ".baton" / "tasks" / "t3"
         task_dir.mkdir(parents=True)
-        (task_dir / "brief.md").write_text("# brief\n\nfilled\n", encoding="utf-8")
+        (task_dir / "brief.md").write_text(
+            '```baton-scope\n{"allow": [], "deny": [], "acceptance": [], "frozen": [], "verify": "none"}\n```\n# brief\n\nfilled\n', encoding="utf-8")
         with patch.object(baton, "launch_leg") as launch, patch.object(baton, "protocol_text", return_value="P"):
             baton.cmd_start(project, Namespace(task="t3"))
         launch.assert_called_once()

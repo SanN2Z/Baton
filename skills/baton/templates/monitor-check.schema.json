@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conclusion", "summary", "findings"],
+  "properties": {
+    "conclusion": {"type": "string", "enum": ["on_track", "drifting", "breaking"]},
+    "summary": {"type": "string", "maxLength": 300},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "severity", "description", "evidence", "rule_source"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^F[1-9][0-9]*$"},
+          "category": {"type": "string", "enum": ["charter_deviation", "precedent_or_message_deviation", "acceptance_gap", "breaking_signal", "out_of_scope", "missing_record", "self_report_mismatch"]},
+          "severity": {"type": "string", "enum": ["blocking", "note"]},
+          "description": {"type": "string"},
+          "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["location", "excerpt"], "properties": {"location": {"type": "string"}, "excerpt": {"type": "string"}}}},
+          "rule_source": {"type": "string"}
+        }
+      }
+    }
+  }
+}

@@ -12,14 +12,38 @@
     "timeout_minutes": 40
   },
   "executor": {
-    "backend": "codex",
-    "model": "gpt-6.1-sol",
+    "backend": "hermes",
+    "hermes_profile": "baton-exec-v2",
+    "provider": "openai-codex",
+    "toolsets": ["file", "terminal", "todo", "baton-memory"],
+    "sandbox_exec": true,
+    "model": "gpt-5.6-luna",
     "reasoning_effort": "xhigh",
+    "escalation": {
+      "enabled": true,
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "after_revise": 2,
+      "after_blocked_or_failed_legs": 2,
+      "max_per_task": 3
+    },
     "service_tier": "default",
     "disable_fast_mode": true,
     "sandbox": "workspace-write",
     "network_access": false,
+    "capacity_retry": {
+      "immediate": 3,
+      "delayed": 1,
+      "delayed_minutes": 15
+    },
     "extra_config": []
+  },
+  "memory": {
+    "backend": "mem0",
+    "embedder": {"provider": "ollama", "model": "qwen3-embedding:0.6b", "num_ctx": 1024, "dims": 1024},
+    "inject_top_k": 10,
+    "core_max_chars": 2200,
+    "curation_model": "sonnet"
   },
   "mode": "standard",
   "supervision": {
@@ -28,12 +52,19 @@
     "first_check_minutes": 10,
     "max_check_minutes": 60,
     "unhandled_stop_minutes": 30,
+    "rule_check_seconds": 60,
+    "check_summary_max_chars": 300,
     "alerts": {
       "delete_ratio": 3,
       "stall_minutes": 20,
       "repeat_fail": 3
     },
-    "test_command": ""
+    "test_command": "",
+    "verify_timeout_minutes": 30
+  },
+  "freeze": {
+    "paths": [],
+    "check_seconds": 60
   },
   "quota": {
     "warn_remaining_percent": 5,

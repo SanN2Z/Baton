@@ -239,6 +239,24 @@ Hermes 在执行每批工具调用之前就把带 tool_calls 的 assistant 消�
 
 连续 REVISE 的计数在出现 APPROVE 或 ACCEPT 后清零，清零后再累计到 2 可以再升一次；Sol 那一轮之后仍没通过，不再自动升级，交 conductor 决定继续用 Sol、拆分任务还是问用户。每个任务自动升级最多 3 次。会话不换，升级的那一轮看得到 Luna 前面的工作。Sol 没有 85% 这项上调，窗口不足 512K 时阈值是 75%，所以 Luna 会话用到 75% 以上时，升级轮开头会先压缩一次，Sol 看到的是摘要。换模型的那一轮会按当时的文件重建系统提示，项目的上下文文件已在锁定范围内。每轮用了哪个模型、为什么升级，记在任务状态里。
 
+## 容量不足的自动重试
+
+Codex 经常报 **model at capacity**（「Selected model is at capacity. Please try a different model.」），有时出在轮中，有时出在会话压缩那一步。以前这类失败都以 FAILED 叫醒 conductor，再由它手动 resume，一个下午能来回好几次。v2 把这件事交给 runner 自己处理，executor 的两种后端和 monitor 的 Codex 运行方式都适用，lean 模式也一样。
+
+runner 按下面几条规则处理，不叫醒 conductor。
+
+1. 判定。一次调用以失败返回、错误文本里含 `at capacity`，算一次容量失败。别的失败照旧以 FAILED 结束这一轮。
+2. 立即重试。容量失败返回后马上重试，不等待。一轮里最多连续立即重试 3 次。
+3. 延后重试。3 次立即重试都以容量失败返回，等 15 分钟再试 1 次，只试这一次。
+4. 结束。延后的那次仍是容量失败，这一轮以 FAILED 结束，事件里写明「容量不足，已自动重试 4 次」和每次的时间。
+5. 续跑方式。重试用同一个会话续跑，带一条固定的短消息，让执行者从中断处接着做，原来那条指挥消息不重发。会话还没建起来就失败的，原样重跑这一轮的命令。
+6. 清零。某次重试跑出了新的模型输出、之后又碰到容量失败，计数从头算，免得一轮跑几个小时、中间偶尔撞上两次就被判失败。
+7. 状态。重试和等待期间这一轮仍是 running，任务状态里记 `capacity_wait`（第几次、下次重试时间）。`baton status` 和 statusline 显示「容量不足，N 分钟后重试」；`baton wait` 只在第 4 条的最终失败时报 FAILED。
+8. 计时与计数。等待的 15 分钟不计入无人监管时长，也不触发停滞类规则信号。容量失败不计入分级执行的「连续 FAILED」。
+9. conductor 收到第 4 条的 FAILED 后照旧只等待、重试或问用户，不接手写代码。
+
+`executor.capacity_retry` 控制这组数字，默认 `{"immediate": 3, "delayed": 1, "delayed_minutes": 15}`；monitor 用同一组设置。
+
 ## 记忆的依据
 
 DolphinBench（arXiv 2609.24971，作者来自 Mem0）用动作来考记忆，出题时避开「按我平常的习惯来」这类点明存储偏好的提示，agent 要自己意识到需要回忆，再把记住的内容落实到工具调用上。论文里有三点和 Baton 的记忆设计直接相关。
@@ -351,7 +369,8 @@ Ollama 已用 install.sh 装好（0.40.3），`ollama` 命令链接在 `~/.local
     "network_access": false,
     "escalation": {"model": "gpt-6.1-sol", "reasoning_effort": "xhigh",
                    "after_revise": 2, "after_blocked_or_failed_legs": 2,
-                   "max_per_task": 3}
+                   "max_per_task": 3},
+    "capacity_retry": {"immediate": 3, "delayed": 1, "delayed_minutes": 15}
   },
   "memory": {
     "backend": "mem0",
@@ -386,6 +405,7 @@ v1 的 `judge.model` 指的是主会话，v1 的 `baton init` 还把 `executor.m
 - [ ] 轮中监督 · 规则信号与 ALERT、方向检查的退避间隔、DRIFT 与 BREAKING 事件、`supervised --dismiss`、未处理满 30 分钟结束本轮、monitor 连续失败时退回 TICK
 - [ ] executor 后端 · Hermes 调用、sandbox-exec 规则、BATON_RESULT 解析与一次纠错续跑、MCP 预检与 ready 标记、读 state.db 取终端调用、外部动作扫描，保留 codex 后端
 - [ ] 分级执行 · 触发条件与清零、FAILED 与 BLOCKED 分类、每任务上限，statusline 显示实际模型
+- [ ] 容量重试 · runner 识别 `at capacity`，失败返回后立即重试、最多 3 次，再 15 分钟后试 1 次，有新输出后计数清零，`capacity_wait` 状态与 status/statusline 显示，等待不计入无人监管时长，codex、hermes 后端与 monitor 共用
 - [ ] 记忆 · `~/.baton/venv` 与 .pth、mem0 配置、带写锁和哈希链的台账、`verify` 与 `reanchor`、`index_pending` 与 `reindex`、常驻块渲染、两路检索与上限、锚点、撤回、MCP server、command 核实、suspended、`seed`、整理回合
 - [ ] 模板 · 简报加范围块，report.html 加「记忆候选」「申辩」两节、「请指挥重点审阅」改为「请重点核对」，leg-result.schema.json 加 memory_used，简报、轮中检查与整理三套 schema，MONITOR_PROMPT 模板，`references/monitor.md`，改写 review（改为读简报、写裁决）、decision、supervision
 - [ ] 配置迁移 · `conductor.*`、`monitor.*`、旧 `judge.model` 兼容、`baton init --migrate`
