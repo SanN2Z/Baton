@@ -5009,8 +5009,39 @@ def _config_assignment(value):
     return key, parsed
 
 
+class _TerminalPrompt:
+    """Separate read and write handles on the controlling terminal.
+
+    A text-mode ``open("/dev/tty", "r+")`` fails with "File or stream is not
+    seekable", because a terminal is not seekable.
+    """
+
+    def __init__(self, path="/dev/tty"):
+        self._reader = open(path, "r", encoding="utf-8")
+        try:
+            self._writer = open(path, "w", encoding="utf-8")
+        except OSError:
+            self._reader.close()
+            raise
+
+    def write(self, text):
+        return self._writer.write(text)
+
+    def flush(self):
+        self._writer.flush()
+
+    def readline(self):
+        return self._reader.readline()
+
+    def close(self):
+        try:
+            self._writer.close()
+        finally:
+            self._reader.close()
+
+
 def _open_tty():
-    return open("/dev/tty", "r+")
+    return _TerminalPrompt()
 
 
 def _require_task_confirmation(task):
