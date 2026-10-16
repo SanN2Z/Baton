@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/brand/baton-wordmark.svg" alt="Baton" width="520"></p>
+
 # Baton
 
 Baton 让 Claude 负责决策和监督，让 Hermes 上的模型执行代码，并把每一轮的证据、裁决和记忆留下来，便于安全续跑。
