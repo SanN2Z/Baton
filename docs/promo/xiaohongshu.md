@@ -35,7 +35,7 @@ v2 是用 v1 的 Baton 造出来的。三天里，Opus 写简报、审了三十�
 3. [记忆](../../assets/promo/03-memory.png)
 4. [验收测试冻结](../../assets/promo/04-frozen-tests.png)
 
-logo 在 `assets/brand/`：方形图标 `baton-logo.svg`、透明底图标 `baton-mark-transparent.svg`、横版字标 `baton-wordmark.svg`，各附一份 2 倍 PNG。
+logo 在 `assets/brand/`，和第一版 claude-all × Baton 的 logo 同一画风：主 logo `baton-v2-logo.png`（三个机器人在轨道上，中间是记忆小本子），横幅 `baton-v2-banner.png`（三个机器人坐在五线谱上），备选 `baton-v2-logo-alt.png`，均为透明底 1254×1254。
 
 ## 话题
 
