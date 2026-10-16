@@ -5242,6 +5242,21 @@ def hermes_executor_env(project, task, leg_n, started_at, cfg, st=None):
     return env
 
 
+def _memory_diff_paths(project, task, st):
+    """Return paths changed by the preceding leg, or no paths when refs are unavailable."""
+    try:
+        prior = (st or {}).get("legs") or []
+        leg = prior[-1] if prior else {}
+        if not isinstance(leg, dict) or not leg.get("start_ref") or not leg.get("end_ref"):
+            return []
+        store = project.store(task, st)
+        if not store:
+            return []
+        return [path for _, _, _, path in diff_tree_entries(store, leg["start_ref"], leg["end_ref"]) if path][:8]
+    except Exception:  # noqa: BLE001 — memory keywords must not block a resumed leg
+        return []
+
+
 def _memory_keyword_fallback(project, task, prompt, st, cfg, reason):
     """System-Python fallback: keyword route only, with no mem0 import."""
     from baton_memory.ledger import MemoryLedger
@@ -5255,10 +5270,7 @@ def _memory_keyword_fallback(project, task, prompt, st, cfg, reason):
     brief = read_text(os.path.join(project.task_dir(task), "brief.md"))
     scope = (st or {}).get("scope") or parse_scope(brief, required=False) or {}
     queries = [brief[:1200], str(prompt)[:1200]] + [str(x) for x in scope.get("allow", [])[:8]]
-    prior = (st or {}).get("legs") or []
-    if prior:
-        diff_items = (prior[-1].get("diff") or []) if isinstance(prior[-1], dict) else []
-        queries.extend(str(item.get("path")) for item in diff_items)
+    queries.extend(_memory_diff_paths(project, task, st))
     previous_ids = [str(item) for leg in (st or {}).get("legs", []) for item in (leg.get("memory_pushed") or [])]
     latest = ledger.latest()
     withdrawals = []
@@ -5291,10 +5303,7 @@ def memory_prompt_for_leg(project, task, prompt, st=None, cfg=None):
     brief = read_text(os.path.join(project.task_dir(task), "brief.md"))
     scope = (st or {}).get("scope") or parse_scope(brief, required=False) or {}
     queries = [brief[:1200], str(prompt)[:1200]] + [str(x) for x in scope.get("allow", [])[:8]]
-    prior = (st or {}).get("legs") or []
-    if prior:
-        diff_items = (prior[-1].get("diff") or []) if isinstance(prior[-1], dict) else []
-        queries.extend(str(item.get("path")) for item in diff_items)
+    queries.extend(_memory_diff_paths(project, task, st))
     payload = {"project_root": project.root, "baton_home": memory_baton_home(cfg), "queries": queries,
                "previous_ids": [str(item) for leg in (st or {}).get("legs", []) for item in (leg.get("memory_pushed") or [])],
                "memory": cfg.get("memory", {})}
