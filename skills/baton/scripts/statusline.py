@@ -73,6 +73,16 @@ def project_dir_of(session):
     return ws.get("project_dir") or ws.get("current_dir") or session.get("cwd") or os.getcwd()
 
 
+def project_baton_json(session):
+    """The project's root baton.json (v2 settings), or {}."""
+    try:
+        with open(os.path.join(project_dir_of(session), "baton.json")) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def executor_config(session):
     cfg = codex_quota.skill_config().get("executor", {})
     try:
@@ -80,6 +90,7 @@ def executor_config(session):
             cfg = {**cfg, **(json.load(f).get("executor") or {})}
     except Exception:
         pass
+    cfg = {**cfg, **(project_baton_json(session).get("executor") or {})}
     return cfg
 
 
@@ -175,10 +186,46 @@ def _running_round(session):
     return None
 
 
+def _latest_task(session):
+    """The most recently updated task (name, last leg number and status), for the idle line."""
+    project_dir = project_dir_of(session)
+    best = None
+    for tasks_dir in (os.path.join(project_dir, ".baton", "tasks"),):
+        try:
+            names = os.listdir(tasks_dir)
+        except OSError:
+            continue
+        for task in names:
+            path = os.path.join(tasks_dir, task, "state.json")
+            try:
+                mtime = os.path.getmtime(path)
+                with open(path, encoding="utf-8") as stream:
+                    state = json.load(stream)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            legs = state.get("legs") or []
+            leg = legs[-1] if legs else {}
+            item = (mtime, task, leg.get("n", len(legs)), leg.get("status") or state.get("status") or "?")
+            if best is None or item[0] > best[0]:
+                best = item
+    return best
+
+
+def idle_line(session):
+    mode = project_baton_json(session).get("mode") or "standard"
+    parts = [f"Baton v2·{mode}", "空闲"]
+    latest = _latest_task(session)
+    if latest:
+        parts.append(f"最近 {latest[1]}·第{latest[2]}轮·{latest[3]}")
+    return " │ ".join(parts)
+
+
 def runtime_line(session):
     info = _running_round(session)
     if not info:
-        return None
+        return idle_line(session)
     model = str(info["model"]) + ("（升级）" if info.get("escalated") else "")
     parts = [f"Baton {info['task']}·第{info['leg']}轮·{model}",
              "monitor 运行中" if info.get("monitor") else "monitor 未运行"]
