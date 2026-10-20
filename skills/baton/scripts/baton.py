@@ -948,6 +948,10 @@ def _evidence_text(project, task, st, leg, dossier_kind, baseline):
         lines.append("\n按文件摘要：")
         for status, path in [(s, p) for _, _, s, p in diff_tree_entries(store, baseline, leg["end_ref"])]:
             lines.append(f"- {status} {path}")
+        new_tests = _task_new_test_files(store, st, leg["end_ref"])
+        if new_tests:
+            lines.append("\n本任务新建的测试文件（任务开始时不存在；「已有测试文件不能改」不适用，执行者可以修改和重组）：")
+            lines += [f"- {path}" for path in new_tests]
     lines += ["", "## 验证", _verification_summary(verify), json.dumps(verify, ensure_ascii=False, indent=2)]
     lines += ["", "## 越界检查", "\n".join(_scope_findings(project, task, st, baseline, leg.get("end_ref"))) or "无"]
     check = check_freeze(project, task, st)
@@ -3949,6 +3953,22 @@ def _probe_blob(store, ref, path):
     return store.git("show", f"{ref}:{path}", check=False)
 
 
+def _new_in_task(store, st, path):
+    """True when path did not exist at the task's base snapshot (created during this task)."""
+    base = (st or {}).get("base_ref")
+    if not base:
+        return False
+    return not store.git("ls-tree", "--name-only", base, "--", path, check=False).strip()
+
+
+def _task_new_test_files(store, st, end_ref):
+    base = (st or {}).get("base_ref")
+    if not base or not end_ref:
+        return []
+    return [path for _, _, status, path in diff_tree_entries(store, base, end_ref)
+            if status == "A" and _is_test_file(path)]
+
+
 def _probe_added_lines(store, old_ref, new_ref, path):
     text = store.git("diff", "--unified=0", old_ref, new_ref, "--", path, check=False)
     return [line[1:] for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
@@ -4057,16 +4077,19 @@ def run_rule_checks(project, task, st, leg):
                 prior.append(new_hash)
                 if len(prior) > 20:
                     del prior[:-20]
+        task_new = _is_test_file(path) and _new_in_task(store, st, path)
+        test_severity = "record" if task_new else "breaking"
+        task_note = "（本任务新建的测试文件）" if task_new else ""
         if status == "D" and _is_test_file(path):
-            alert = _rule_alert(leg, "deleted_test_file", "breaking", path, f"deleted_test_file:{path}")
+            alert = _rule_alert(leg, "deleted_test_file", test_severity, path + task_note, f"deleted_test_file:{path}")
             if alert:
                 alerts.append(alert)
         if _is_test_file(path) and status != "D":
             old_tests = len(re.findall(r"^\s*def\s+test_", old_text, re.M)) + len(re.findall(r"\bassert\b", old_text))
             new_tests = len(re.findall(r"^\s*def\s+test_", new_text, re.M)) + len(re.findall(r"\bassert\b", new_text))
             if old_tests > new_tests:
-                alert = _rule_alert(leg, "test_count_decreased", "breaking",
-                                    f"{path}: {old_tests} -> {new_tests}", f"test_count_decreased:{path}")
+                alert = _rule_alert(leg, "test_count_decreased", test_severity,
+                                    f"{path}: {old_tests} -> {new_tests}{task_note}", f"test_count_decreased:{path}")
                 if alert:
                     alerts.append(alert)
         added = _probe_added_lines(store, old_ref, probe_commit, path) if status != "D" else []

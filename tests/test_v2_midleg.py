@@ -167,6 +167,28 @@ class MidlegTests(unittest.TestCase):
                                        self.project.load_state("t")["legs"][0])
         self.assertEqual(second, [])
 
+    def test_task_created_test_file_shrinking_is_a_record_not_breaking(self):
+        old_file = self.root / "test_old.py"
+        old_file.write_text("def test_a():\n assert 1\n\ndef test_b():\n assert 2\n", encoding="utf-8")
+        store, _ = self.running_leg()
+        new_file = self.root / "test_new.py"
+        new_file.write_text("def test_a():\n assert 1\n\ndef test_b():\n assert 2\n", encoding="utf-8")
+        commit = store.snapshot("probe baseline")
+        store.git("update-ref", "refs/baton/t/probe", commit)
+        self.project.update_state("t", lambda s: baton.current_leg(s).update(
+            probe_commit=commit, probe_ref="refs/baton/t/probe"))
+        old_file.write_text("def test_a():\n assert 1\n", encoding="utf-8")
+        new_file.write_text("def test_a():\n assert 1\n", encoding="utf-8")
+        state = self.project.load_state("t")
+        alerts = baton.run_rule_checks(self.project, "t", state, baton.current_leg(state))
+        by_path = {item["evidence"].split(":")[0]: item for item in alerts if item["rule"] == "test_count_decreased"}
+        self.assertEqual(by_path["test_old.py"]["category"], "breaking")
+        self.assertEqual(by_path["test_new.py"]["category"], "record")
+        self.assertIn("本任务新建", by_path["test_new.py"]["evidence"])
+        store2 = self.project.store("t")
+        end = store2.snapshot("end")
+        self.assertEqual(baton._task_new_test_files(store2, self.project.load_state("t"), end), ["test_new.py"])
+
     def test_deleted_test_file_hit_and_non_test_delete_misses(self):
         test_path = self.root / "test_api.py"
         test_path.write_text("def test_a():\n assert 1\n", encoding="utf-8")
