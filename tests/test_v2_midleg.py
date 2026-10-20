@@ -345,6 +345,25 @@ class MidlegTests(unittest.TestCase):
             baton.cmd_refs(self.project, argparse.Namespace(task="t"))
         self.assertNotIn("/probe", refs.getvalue())
 
+    def test_late_check_of_an_earlier_leg_does_not_stop_the_current_leg(self):
+        self.make_probe()
+        leg = self.project.load_state("t")["legs"][0]
+        dossier = baton.build_check_dossier(self.project, "t", self.project.load_state("t"), leg)
+        second = dict(leg, n=2, status="running", alerts=[], alert_keys=[])
+        self.project.update_state("t", lambda s: s.update(legs=[dict(leg, status="breaking"), second]))
+        with patch.object(baton, "kill_codex") as kill:
+            baton.apply_monitor_check_result(self.project, "t", dossier,
+                                              {"conclusion": "breaking", "summary": "late", "findings": []}, 1)
+        state = self.project.load_state("t")
+        self.assertNotIn("supervision_action", state)
+        self.assertFalse(kill.called)
+        self.assertFalse(Path(self.project.leg_path("t", 2, "stop")).exists())
+        self.assertTrue(state["legs"][0]["monitor_check"]["stale"])
+        self.assertEqual(state["legs"][1]["status"], "running")
+        baton.apply_monitor_check_result(self.project, "t", dossier,
+                                          {"conclusion": "drifting", "summary": "late", "findings": []}, 1)
+        self.assertFalse((self.project.load_state("t").get("pending_drift") or {}).get("dossier"))
+
     def test_backoff_is_ten_twenty_forty_sixty_sixty(self):
         self.make_probe()
         values = []

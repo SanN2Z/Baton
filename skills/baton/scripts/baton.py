@@ -1772,6 +1772,8 @@ def apply_monitor_check_result(project, task, dossier_id, value, leg_n):
         with open(brief_path, "w", encoding="utf-8") as stream:
             stream.write(render_monitor_check(project, task, dossier_id, value))
     record = _check_event_record(project, task, dossier_id, value, brief_path)
+    latest = current_leg(project.read_state(task, {}) or {}) or {}
+    stale = latest.get("n") is not None and latest.get("n") != leg_n
     def update(state):
         leg = next((item for item in state.get("legs", []) if item.get("n") == leg_n), None)
         if leg is None:
@@ -1783,6 +1785,12 @@ def apply_monitor_check_result(project, task, dossier_id, value, leg_n):
                       "ledger_seq": record.get("seq")})
         leg["monitor_check"] = check
         leg["monitor_check_failures"] = 0
+        if stale:
+            # A check of an earlier leg that finished after a newer leg started: keep it on that
+            # leg for the record, but it must not steer, stop or clear the current leg.
+            check["stale"] = True
+            leg["monitor_check"] = check
+            return
         state["supervision_fallback"] = False
         leg["supervision_fallback"] = False
         if conclusion == "drifting":
@@ -1809,7 +1817,7 @@ def apply_monitor_check_result(project, task, dossier_id, value, leg_n):
         leg["last_check"] = {"dossier": dossier_id, "conclusion": conclusion, "at": now(), "brief_path": brief_path}
         leg["check_baseline_ref"] = leg.get("probe_commit") or leg.get("check_baseline_ref")
     project.update_state(task, update)
-    if conclusion == "breaking":
+    if conclusion == "breaking" and not stale:
         state = project.read_state(task, {}) or {}
         leg = current_leg(state)
         if leg:
