@@ -140,6 +140,7 @@ baton rule <task> <curation-dossier> <verdict-file> --curation
 | `baton decide <task> <D号> <file>` | 入账决定文件 |
 | `baton supervised <task> --verdict ...` | 记录 TICK 监管结论 |
 | `baton restore-frozen` / `baton amend` | 恢复冻结或提交用户核准的修正案 |
+| `baton preset list` / `baton preset use <名> [--task <任务>]` | 列出或切换 baton.json `presets` 里的执行者/monitor 预设；带 `--task` 时同步已启动任务的配置快照（该任务不能有运行中的一轮） |
 | `baton close <task>` | 验收通过后关闭任务 |
 | `baton memory install/verify/reindex` | 安装、校验、重建记忆索引 |
 

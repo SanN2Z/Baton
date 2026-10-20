@@ -358,6 +358,55 @@ print("session_id: fake-session", file=sys.stderr)
         with self.assertRaises(baton.ConfigError):
             baton.hermes_preflight(project, cfg)
 
+    def test_preset_use_switches_executor_and_monitor_and_task_snapshot(self):
+        project = self._init()
+        path = Path(project.baton_config_path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["presets"] = {
+            "codex": {"executor": {"backend": "hermes", "provider": "openai-codex", "model": "gpt-6.1-sol",
+                                   "reasoning_effort": "max", "service_tier": "priority",
+                                   "disable_fast_mode": False, "escalation": {"enabled": False}},
+                      "monitor": {"model": "gpt-6.1-sol", "reasoning_effort": "ultra", "service_tier": "priority"}},
+            "deepseek": {"executor": {"backend": "hermes", "provider": "deepseek", "model": "deepseek-v4-flash",
+                                      "reasoning_effort": "max"},
+                         "monitor": {"backend": "hermes", "provider": "deepseek", "model": "deepseek-v4-pro",
+                                     "reasoning_effort": "high"}},
+            "broken": {"monitor": {"model": ""}},
+        }
+        path.write_text(json.dumps(data), encoding="utf-8")
+        project = baton.Project(str(self.project_root))
+        baton.cmd_new(project, Namespace(task="t", template=None, brief=None))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            baton.cmd_preset(project, Namespace(action="use", name="deepseek", task=["t"]))
+        self.assertIn("还没启动", out.getvalue())
+        os.makedirs(baton.freeze_dir(project, "t"), exist_ok=True)
+        project.update_state("t", lambda state: state.update(task="t", legs=[], config_snapshot=project.config))
+        baton.cmd_preset(project, Namespace(action="use", name="deepseek", task=["t"]))
+        cfg = project.config
+        self.assertEqual((cfg["executor"]["provider"], cfg["executor"]["model"]), ("deepseek", "deepseek-v4-flash"))
+        self.assertEqual((cfg["monitor"]["backend"], cfg["monitor"]["provider"]), ("hermes", "deepseek"))
+        self.assertIn("provider: deepseek", (Path(baton.hermes_profile_dir(cfg)) / "config.yaml").read_text())
+        snapshot = baton.config_for_state(project, project.load_state("t"))
+        self.assertEqual(snapshot["monitor"]["model"], "deepseek-v4-pro")
+        baton.cmd_preset(project, Namespace(action="use", name="codex", task=["t"]))
+        cfg = project.config
+        self.assertEqual(cfg["executor"]["model"], "gpt-6.1-sol")
+        self.assertIsNone(cfg["monitor"].get("provider"))
+        self.assertIsNone(cfg["monitor"].get("backend"))
+        self.assertEqual(baton.monitor_backend(cfg), "codex")
+        snapshot = baton.config_for_state(project, project.load_state("t"))
+        self.assertEqual((snapshot["monitor"]["model"], snapshot["monitor"].get("provider")), ("gpt-6.1-sol", None))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            baton.cmd_preset(project, Namespace(action="list", name=None, task=[]))
+        self.assertIn("* codex", out.getvalue())
+        self.assertIn("  deepseek", out.getvalue())
+        before = path.read_text(encoding="utf-8")
+        with self.assertRaises(baton.ConfigError):
+            baton.cmd_preset(project, Namespace(action="use", name="broken", task=[]))
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
     def test_state_db_terminal_calls_follow_compression_chain(self):
         project = self._init()
         cfg = project.config

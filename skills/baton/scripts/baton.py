@@ -5191,6 +5191,90 @@ def _adopt_freeze_entries(project, task, manifest, paths):
     return manifest
 
 
+PRESET_KEYS = {
+    "executor": ("backend", "provider", "model", "reasoning_effort", "service_tier", "disable_fast_mode", "escalation"),
+    "monitor": ("backend", "provider", "base_url", "model", "reasoning_effort", "final_reasoning_effort", "service_tier"),
+}
+
+
+def _preset_summary(preset):
+    ex, mon = preset.get("executor") or {}, preset.get("monitor") or {}
+    tier = "·fast" if ex.get("service_tier") == "priority" else ""
+    mon_via = mon.get("backend") or "codex"
+    return (f"执行者 {ex.get('provider', 'openai-codex')}/{ex.get('model')}·{ex.get('reasoning_effort')}{tier}；"
+            f"monitor {mon_via}/{mon.get('provider') or 'openai'}/{mon.get('model')}·{mon.get('reasoning_effort')}")
+
+
+def _preset_active(cfg, preset):
+    def same(have, want):
+        if isinstance(want, dict):
+            return isinstance(have, dict) and all(same(have.get(k), v) for k, v in want.items())
+        return have == want
+    return all(same(cfg.get(role, {}).get(key), value)
+               for role, keys in PRESET_KEYS.items()
+               for key, value in (preset.get(role) or {}).items() if key in keys)
+
+
+def cmd_preset(project, args):
+    """List or switch the executor/monitor presets stored under baton.json "presets"."""
+    data = project.read_baton_config()
+    presets = data.get("presets") or {}
+    if not isinstance(presets, dict):
+        raise ConfigError("baton.json 的 presets 必须是 JSON object")
+    if args.action == "list":
+        if not presets:
+            print("baton.json 里没有 presets")
+            return
+        cfg = project.config
+        for name, preset in presets.items():
+            mark = "*" if _preset_active(cfg, preset) else " "
+            note = f"  {preset['description']}" if preset.get("description") else ""
+            print(f"{mark} {name}：{_preset_summary(preset)}{note}")
+        return
+    if not args.name:
+        die("baton preset use 需要预设名")
+    if args.name not in presets:
+        die(f"没有预设 {args.name}；可选：{', '.join(presets) or '无'}")
+    preset = presets[args.name]
+    started = []
+    for task in args.task or []:
+        check_task(task)
+        st = project.read_state(task)
+        if st is None:
+            print(f"任务 {task} 还没启动，启动时会按新的 baton.json 生成配置快照")
+            continue
+        leg = current_leg(st)
+        if leg and (leg.get("status") == "running" or codex_alive(leg)):
+            die(f"任务 {task} 有运行中的一轮，先 baton stop 再切换预设")
+        started.append(task)
+    new = json.loads(json.dumps(data))
+    for role, keys in PRESET_KEYS.items():
+        section = {k: v for k, v in (new.get(role) or {}).items() if k not in keys}
+        section.update({k: v for k, v in (preset.get(role) or {}).items() if k in keys})
+        new[role] = section
+    path = project.baton_config_path
+    previous = read_text(path)
+    write_json(path, new)
+    try:
+        cfg = project.config
+    except ConfigError:
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(previous)
+        raise
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write("\n")
+    if cfg["executor"].get("backend") == "hermes" and os.path.isdir(hermes_profile_dir(cfg)):
+        _write_readonly_profile_file(os.path.join(hermes_profile_dir(cfg), "config.yaml"), hermes_config_text(cfg),
+                                     cfg, upgrade=True)
+    print(f"已切换到预设 {args.name}：{_preset_summary(preset)}")
+    for task in started:
+        assignments = [f"{role}.{key}={json.dumps(cfg[role].get(key), ensure_ascii=False)}"
+                       for role, keys in PRESET_KEYS.items() for key in keys]
+        cmd_amend(project, argparse.Namespace(task=task, amendment_file=None, config=assignments,
+                                              adopt=[], user_approved=False))
+        print(f"任务 {task} 的配置快照已同步到预设 {args.name}")
+
+
 def cmd_amend(project, args):
     project.require_init()
     check_task(args.task)
@@ -9167,6 +9251,10 @@ def main():
     s.add_argument("--config", action="append", default=[], metavar="键=值")
     s.add_argument("--adopt", action="append", default=[], metavar="路径")
     s.add_argument("--user-approved", action="store_true")
+    s = sub.add_parser("preset", help="列出或切换 baton.json 里的执行者/monitor 预设")
+    s.add_argument("action", choices=("list", "use"))
+    s.add_argument("name", nargs="?")
+    s.add_argument("--task", action="append", default=[], help="同时把这些任务的配置快照切到该预设（可重复）")
     sub.add_parser("list", help="列出任务")
     s = sub.add_parser("config", help="显示生效配置")
     s.add_argument("--json", action="store_true", help="输出完整合并后的 JSON 配置")
@@ -9218,7 +9306,7 @@ def main():
         "close": cmd_close,
         "supervised": cmd_supervised, "stop": cmd_stop, "checkpoint": cmd_checkpoint, "refs": cmd_refs,
         "diff": cmd_diff, "rollback": cmd_rollback, "list": cmd_list, "config": cmd_config, "quota": cmd_quota,
-        "doctor": cmd_doctor, "memory": cmd_memory, "restore-frozen": cmd_restore_frozen, "amend": cmd_amend, "_run": cmd_run,
+        "doctor": cmd_doctor, "memory": cmd_memory, "restore-frozen": cmd_restore_frozen, "amend": cmd_amend, "preset": cmd_preset, "_run": cmd_run,
         "_monitor": cmd_monitor_run, "_monitor_check": cmd_monitor_check_run, "rule": cmd_rule, "decide": cmd_decide,
     }[args.cmd]
     if args.cmd == "steer":
