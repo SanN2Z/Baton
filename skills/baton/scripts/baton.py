@@ -1405,6 +1405,38 @@ def monitor_prompt_for(cfg, prompt, schema_path):
             "JSON Schema, with no prose before or after it and no code fences:\n" + read_text(schema_path))
 
 
+def monitor_backend(cfg):
+    """codex (default; Claude aliases run through the Claude CLI) or hermes."""
+    return str((cfg.get("monitor") or {}).get("backend") or "codex").strip().lower()
+
+
+def _monitor_hermes_command(project, dossier_id, cfg, effort, prompt):
+    """A read-only Hermes call: sandboxed writes, no SOUL/AGENTS rules, file and terminal tools only."""
+    mon = cfg.get("monitor") or {}
+    profile = (cfg.get("executor") or {}).get("hermes_profile", "baton-exec-v2")
+    provider = monitor_provider(cfg)
+    if not provider:
+        raise ConfigError("monitor.backend=hermes 需要 monitor.provider（例如 deepseek）")
+    profile_dir = hermes_profile_dir(cfg)
+    home = os.path.expanduser("~")
+    defines = {"PROFILE_DIR": profile_dir, "TMP_DIR": "/private/tmp", "VAR_TMP_DIR": "/private/var/tmp",
+               "TMP_FOLDERS_DIR": "/private/var/folders",
+               "CACHE_HOME": os.path.join(home, "Library", "Caches"), "USER_CACHE": os.path.join(home, ".cache"),
+               "PROFILE_SOUL": os.path.join(profile_dir, "SOUL.md"),
+               "PROFILE_CONFIG": os.path.join(profile_dir, "config.yaml"),
+               "PROFILE_ENV": os.path.join(profile_dir, ".env")}
+    args = ["sandbox-exec", "-f", os.path.join(TEMPLATES, "hermes-monitor-sandbox.sb")]
+    for key, value in defines.items():
+        args += ["-D", f"{key}={canonical_dir(value)}"]
+    toolsets = mon.get("toolsets") or ["file", "terminal"]
+    args += [hermes_executable(cfg), "-p", profile, "chat", "-Q", "--query=" + str(prompt),
+             "--provider", provider, "-m", mon["model"], "--source", "tool", "--yolo",
+             "--ignore-rules", "-t", ",".join(toolsets)]
+    if effort is not None:
+        args += ["--reasoning", str(effort)]
+    return args
+
+
 def read_monitor_json(path):
     """The monitor's JSON output; tolerates a code fence or prose around one JSON object."""
     value = read_json(path)
@@ -1473,6 +1505,12 @@ def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n
         env.update({"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
                     "ENABLE_CLAUDEAI_MCP_SERVERS": "false"})
         command = _monitor_claude_command(project, dossier_id, cfg, effort, schema_path=schema_path)
+    elif monitor_backend(cfg) == "hermes":
+        prompt = monitor_prompt_for(cfg, prompt, schema_path)
+        command = _monitor_hermes_command(project, dossier_id, cfg, effort, prompt)
+        env = _hermes_subprocess_env(cfg)
+        prompt = None
+        output_path = events_path
     else:
         command = _monitor_codex_command(project, dossier_id, cfg, output_path, effort, schema_path=schema_path)
         env.update(monitor_provider_env(cfg))
@@ -1491,7 +1529,8 @@ def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n
         else:
             event_stream = open(events_path, "w", encoding="utf-8")
             error_stream = open(stderr_path, "w", encoding="utf-8")
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id),
+                                    stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
                                     stdout=event_stream, stderr=error_stream, text=True, env=env,
                                     start_new_session=True)
         project.update_state(task, lambda s: _set_monitor_running(s, leg_n, dossier_id, proc.pid, attempt, started))
@@ -1567,6 +1606,12 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
         env.update({"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
                     "ENABLE_CLAUDEAI_MCP_SERVERS": "false"})
         command = _monitor_claude_command(project, dossier_id, cfg, effort, schema_path=schema_path)
+    elif monitor_backend(cfg) == "hermes":
+        prompt = monitor_prompt_for(cfg, prompt, schema_path)
+        command = _monitor_hermes_command(project, dossier_id, cfg, effort, prompt)
+        env = _hermes_subprocess_env(cfg)
+        prompt = None
+        output_path = events_path
     else:
         command = _monitor_codex_command(project, dossier_id, cfg, output_path, effort, schema_path=schema_path)
         env.update(monitor_provider_env(cfg))
@@ -1584,7 +1629,8 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
         else:
             event_stream = open(events_path, "w", encoding="utf-8")
             error_stream = open(stderr_path, "w", encoding="utf-8")
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id),
+                                    stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
                                     stdout=event_stream, stderr=error_stream, text=True, env=env,
                                     start_new_session=True)
         project.update_state(task, lambda s: _set_check_running(s, leg_n, dossier_id, proc.pid, attempt, started))

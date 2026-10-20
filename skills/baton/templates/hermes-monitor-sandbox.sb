@@ -1,0 +1,22 @@
+(version 1)
+
+; Read-only monitor under Hermes.  The runner supplies all paths with -D.
+; Reads are unrestricted; writes are limited to this Hermes profile's own
+; state (sessions, logs), temporary directories and local caches.  The
+; project, the dossier and Baton's state stay read-only.
+(allow default)
+(deny file-write*)
+(allow file-write*
+    (subpath (param "PROFILE_DIR"))
+    (subpath (param "TMP_DIR"))
+    (subpath (param "VAR_TMP_DIR"))
+    (subpath (param "TMP_FOLDERS_DIR"))
+    (subpath (param "CACHE_HOME"))
+    (subpath (param "USER_CACHE"))
+    (literal "/dev/null")
+    (literal "/dev/tty")
+    (literal "/dev/dtracehelper"))
+
+(deny file-write* (literal (param "PROFILE_SOUL")))
+(deny file-write* (literal (param "PROFILE_CONFIG")))
+(deny file-write* (literal (param "PROFILE_ENV")))

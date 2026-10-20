@@ -202,6 +202,29 @@ else:
         Path(out).write_text("no json here", encoding="utf-8")
         self.assertIsNone(baton.read_monitor_json(out))
 
+    def test_hermes_monitor_is_sandboxed_read_only_and_parses_stdout(self):
+        dossier = self.make_dossier()
+        cfg = self.cfg(model="deepseek-v4-pro", provider="deepseek", backend="hermes", reasoning_effort="high")
+        self.assertEqual(baton.monitor_backend(cfg), "hermes")
+        self.assertEqual(baton.monitor_backend(self.cfg()), "codex")
+        command = baton._monitor_hermes_command(self.project, dossier, cfg, "high", "review")
+        self.assertEqual(command[:3], ["sandbox-exec", "-f", str(ROOT / "skills/baton/templates/hermes-monitor-sandbox.sb")])
+        defines = [command[i + 1] for i, item in enumerate(command) if item == "-D"]
+        self.assertFalse(any(item.startswith(("PROJECT=", "BATON_HOME=")) for item in defines))
+        self.assertIn("--ignore-rules", command)
+        self.assertEqual(command[command.index("--provider") + 1], "deepseek")
+        self.assertEqual(command[command.index("-m") + 1], "deepseek-v4-pro")
+        self.assertEqual(command[command.index("--reasoning") + 1], "high")
+        self.assertEqual(command[command.index("-t") + 1], "file,terminal")
+        self.assertIn("--query=review", command)
+        sandbox = (ROOT / "skills/baton/templates/hermes-monitor-sandbox.sb").read_text()
+        self.assertNotIn('"PROJECT"', sandbox)
+        with self.assertRaises(baton.ConfigError):
+            baton._monitor_hermes_command(self.project, dossier, self.cfg(backend="hermes"), None, "review")
+        out = Path(self.project.state_dir) / "hermes.out"
+        out.write_text('{"summary": "ok"}\n\nsession_id: 20261020_000000_000000\n', encoding="utf-8")
+        self.assertEqual(baton.read_monitor_json(str(out)), {"summary": "ok"})
+
     def test_monitor_probe_uses_isolated_flags_and_records_state(self):
         bindir = Path(self.tmp.name) / "probe-bin"
         bindir.mkdir()
