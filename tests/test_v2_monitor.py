@@ -195,6 +195,9 @@ else:
         schema = ROOT / "skills/baton/templates/monitor-brief.schema.json"
         prompt = baton.monitor_prompt_for(cfg, "brief please", str(schema))
         self.assertIn('"recommendation"', prompt)
+        self.assertIn("at most 600 characters", prompt)
+        check_schema = ROOT / "skills/baton/templates/monitor-check.schema.json"
+        self.assertIn("at most 300 characters", baton.monitor_prompt_for(cfg, "check", str(check_schema)))
         self.assertEqual(baton.monitor_prompt_for(self.cfg(), "brief please", str(schema)), "brief please")
         self.assertEqual(baton.monitor_provider(self.cfg()), "")
         Path(out).write_text('```json\n{"summary": "ok"}\n```\n', encoding="utf-8")

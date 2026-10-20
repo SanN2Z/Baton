@@ -1401,8 +1401,12 @@ def monitor_prompt_for(cfg, prompt, schema_path):
     """Providers other than OpenAI ignore --output-schema, so state the schema in the prompt."""
     if not monitor_provider(cfg):
         return prompt
+    limit = 300 if os.path.basename(schema_path) == "monitor-check.schema.json" else 600
     return (prompt + "\n\nFinal answer format: reply with exactly one JSON object that validates against this "
-            "JSON Schema, with no prose before or after it and no code fences:\n" + read_text(schema_path))
+            "JSON Schema, with no prose before or after it and no code fences:\n" + read_text(schema_path)
+            + f"\n\nHard limit: `summary` must be at most {limit} characters (each Chinese character counts as one); "
+            f"an over-long summary makes the whole answer invalid. Aim for about {limit * 2 // 3} characters "
+            "and put details in `findings` instead.")
 
 
 def monitor_backend(cfg):
