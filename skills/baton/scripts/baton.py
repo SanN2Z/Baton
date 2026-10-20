@@ -1765,6 +1765,16 @@ def _persist_leg_stop_reason(project, task, leg_n, reason):
 def apply_monitor_check_result(project, task, dossier_id, value, leg_n):
     """Persist a successful check and apply its conclusion to the running leg."""
     conclusion = value.get("conclusion")
+    leg_alerts = ((next((item for item in (project.read_state(task, {}) or {}).get("legs", [])
+                        if item.get("n") == leg_n), None) or {}).get("alerts") or [])
+    if conclusion == "breaking" and not any(
+            isinstance(item, dict) and item.get("category") == "breaking_signal"
+            for item in value.get("findings") or []) and not any(
+            isinstance(alert, dict) and alert.get("category") == "breaking" for alert in leg_alerts):
+        # Incomplete work is not breaking: without a breaking_signal finding the leg keeps
+        # running and the conductor handles the check as a drift.
+        value = dict(value, conclusion="drifting", downgraded_from="breaking")
+        conclusion = "drifting"
     brief_path = ""
     if conclusion in {"drifting", "breaking"}:
         brief_path = project.p("reviews", dossier_id + "-brief.md")

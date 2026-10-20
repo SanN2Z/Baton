@@ -364,6 +364,29 @@ class MidlegTests(unittest.TestCase):
                                           {"conclusion": "drifting", "summary": "late", "findings": []}, 1)
         self.assertFalse((self.project.load_state("t").get("pending_drift") or {}).get("dossier"))
 
+    def test_breaking_without_a_breaking_signal_is_downgraded_to_drifting(self):
+        self.make_probe()
+        leg = self.project.load_state("t")["legs"][0]
+        dossier = baton.build_check_dossier(self.project, "t", self.project.load_state("t"), leg)
+        gap = {"id": "F1", "category": "acceptance_gap", "severity": "blocking",
+               "description": "steer item not done yet", "evidence": [], "rule_source": "charter"}
+        with patch.object(baton, "kill_codex") as kill:
+            baton.apply_monitor_check_result(self.project, "t", dossier,
+                                              {"conclusion": "breaking", "summary": "not done", "findings": [gap]}, 1)
+        state = self.project.load_state("t")
+        self.assertNotIn("supervision_action", state)
+        self.assertFalse(kill.called)
+        self.assertEqual(state["pending_drift"]["dossier"], dossier)
+        self.assertEqual(state["legs"][0]["monitor_check"]["conclusion"], "drifting")
+        leg = self.project.load_state("t")["legs"][0]
+        dossier = baton.build_check_dossier(self.project, "t", self.project.load_state("t"), leg)
+        signal = dict(gap, category="breaking_signal")
+        with patch.object(baton, "kill_codex") as kill:
+            baton.apply_monitor_check_result(self.project, "t", dossier,
+                                              {"conclusion": "breaking", "summary": "broken", "findings": [signal]}, 1)
+        self.assertEqual(self.project.load_state("t").get("supervision_action"), "breaking")
+        self.assertTrue(kill.called)
+
     def test_backoff_is_ten_twenty_forty_sixty_sixty(self):
         self.make_probe()
         values = []
