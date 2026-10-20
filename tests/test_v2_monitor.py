@@ -175,6 +175,33 @@ else:
         stream = baton._monitor_claude_command(self.project, dossier, claude_cfg, stream=True)
         self.assertIn("--verbose", stream)
 
+    def test_provider_monitor_uses_hermes_key_prompt_schema_and_lenient_json(self):
+        dossier = self.make_dossier()
+        cfg = self.cfg(model="deepseek-v4-pro", provider="deepseek", reasoning_effort="high")
+        out = str(Path(self.project.state_dir) / "out.json")
+        command = baton._monitor_codex_command(self.project, dossier, cfg, out, "high")
+        self.assertIn('model_provider="deepseek"', command)
+        provider_arg = next(item for item in command if item.startswith("model_providers.deepseek="))
+        self.assertIn('base_url="https://api.deepseek.com/v1"', provider_arg)
+        self.assertIn('wire_api="responses"', provider_arg)
+        self.assertIn(f'env_key="{baton.MONITOR_KEY_ENV}"', provider_arg)
+        with self.assertRaises(baton.ConfigError):
+            baton.monitor_provider_env(cfg)
+        auth = Path(baton.hermes_profile_auth_path(cfg))
+        auth.parent.mkdir(parents=True, exist_ok=True)
+        auth.write_text(json.dumps({"credential_pool": {"deepseek": [{"id": "d", "access_token": "sk-test"}]}}),
+                        encoding="utf-8")
+        self.assertEqual(baton.monitor_provider_env(cfg), {baton.MONITOR_KEY_ENV: "sk-test"})
+        schema = ROOT / "skills/baton/templates/monitor-brief.schema.json"
+        prompt = baton.monitor_prompt_for(cfg, "brief please", str(schema))
+        self.assertIn('"recommendation"', prompt)
+        self.assertEqual(baton.monitor_prompt_for(self.cfg(), "brief please", str(schema)), "brief please")
+        self.assertEqual(baton.monitor_provider(self.cfg()), "")
+        Path(out).write_text('```json\n{"summary": "ok"}\n```\n', encoding="utf-8")
+        self.assertEqual(baton.read_monitor_json(out), {"summary": "ok"})
+        Path(out).write_text("no json here", encoding="utf-8")
+        self.assertIsNone(baton.read_monitor_json(out))
+
     def test_monitor_probe_uses_isolated_flags_and_records_state(self):
         bindir = Path(self.tmp.name) / "probe-bin"
         bindir.mkdir()

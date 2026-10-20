@@ -1359,10 +1359,65 @@ def _monitor_codex_command(project, dossier_id, cfg, output_path, effort=None, s
     command = ["codex", "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                "--skip-git-repo-check", "-s", "read-only", "-C", dossier_path(project, dossier_id),
                "-m", model]
+    provider = monitor_provider(cfg)
+    if provider:
+        base_url = (cfg.get("monitor") or {}).get("base_url") or MONITOR_PROVIDER_URLS.get(provider)
+        if not base_url:
+            raise ConfigError(f"monitor.provider={provider} 需要 monitor.base_url")
+        command += ["-c", f'model_provider="{provider}"',
+                    "-c", (f'model_providers.{provider}={{name="{provider}",base_url="{base_url}",'
+                           f'env_key="{MONITOR_KEY_ENV}",wire_api="responses"}}')]
     if effort is not None:
         command += ["-c", f'model_reasoning_effort="{effort}"']
     command += ["--output-schema", schema_path or os.path.join(TEMPLATES, "monitor-brief.schema.json"), "-o", output_path, "-"]
     return command
+
+
+MONITOR_KEY_ENV = "BATON_MONITOR_API_KEY"
+MONITOR_PROVIDER_URLS = {"deepseek": "https://api.deepseek.com/v1"}
+
+
+def monitor_provider(cfg):
+    """A non-OpenAI provider for a Codex-run monitor (e.g. deepseek), or "" for Codex's own login."""
+    value = str((cfg.get("monitor") or {}).get("provider") or "").strip().lower().replace("_", "-")
+    return "" if value in ("", "openai", "openai-codex") else value
+
+
+def monitor_provider_env(cfg):
+    """Environment for a provider-backed monitor: the key comes from the Hermes profile's credential pool
+    for that provider and is only placed in the monitor subprocess environment."""
+    provider = monitor_provider(cfg)
+    if not provider:
+        return {}
+    entries = _profile_provider_credentials(hermes_profile_auth_path(cfg), provider)
+    keys = [item.get("access_token") or item.get("api_key") for item in entries]
+    keys = [key for key in keys if isinstance(key, str) and key]
+    if len(keys) != 1:
+        raise ConfigError(f"monitor.provider={provider}：Hermes profile 里必须恰好有一条带密钥的 {provider} 凭据，当前 {len(keys)} 条")
+    return {MONITOR_KEY_ENV: keys[0]}
+
+
+def monitor_prompt_for(cfg, prompt, schema_path):
+    """Providers other than OpenAI ignore --output-schema, so state the schema in the prompt."""
+    if not monitor_provider(cfg):
+        return prompt
+    return (prompt + "\n\nFinal answer format: reply with exactly one JSON object that validates against this "
+            "JSON Schema, with no prose before or after it and no code fences:\n" + read_text(schema_path))
+
+
+def read_monitor_json(path):
+    """The monitor's JSON output; tolerates a code fence or prose around one JSON object."""
+    value = read_json(path)
+    if value is not None:
+        return value
+    text = read_text(path) if os.path.exists(path) else ""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        return None
 
 
 def _monitor_claude_command(project, dossier_id, cfg, effort=None, stream=False, schema_path=None):
@@ -1397,7 +1452,7 @@ def _monitor_result_from_files(project, dossier_id, model, output_path, stdout):
                 return None, "Claude 返回错误"
             return value["structured_output"], ""
         return None, "Claude 输出缺少 structured_output"
-    value = read_json(output_path)
+    value = read_monitor_json(output_path)
     return (value, "") if value is not None else (None, "Codex 没有写出 JSON 简报")
 
 
@@ -1420,6 +1475,8 @@ def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n
         command = _monitor_claude_command(project, dossier_id, cfg, effort, schema_path=schema_path)
     else:
         command = _monitor_codex_command(project, dossier_id, cfg, output_path, effort, schema_path=schema_path)
+        env.update(monitor_provider_env(cfg))
+        prompt = monitor_prompt_for(cfg, prompt, schema_path)
     if leg_n is None:
         state = project.read_state(task, {}) or {}
         leg_n = (current_leg(state) or {}).get("n")
@@ -1512,6 +1569,8 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
         command = _monitor_claude_command(project, dossier_id, cfg, effort, schema_path=schema_path)
     else:
         command = _monitor_codex_command(project, dossier_id, cfg, output_path, effort, schema_path=schema_path)
+        env.update(monitor_provider_env(cfg))
+        prompt = monitor_prompt_for(cfg, prompt, schema_path)
     if leg_n is None:
         leg_n = (current_leg(state) or {}).get("n")
     started = now()
@@ -1565,7 +1624,7 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
             return None, "Claude 输出不是 JSON", attempt, None
         value = wrapper.get("structured_output") if isinstance(wrapper, dict) else None
     else:
-        value = read_json(output_path)
+        value = read_monitor_json(output_path)
     if not isinstance(value, dict):
         return None, "轮中检查没有写出 JSON", attempt, None
     errors = _validate_monitor_check(value, (cfg.get("supervision") or {}).get("check_summary_max_chars", 300))
