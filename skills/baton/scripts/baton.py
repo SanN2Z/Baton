@@ -1369,6 +1369,9 @@ def _monitor_codex_command(project, dossier_id, cfg, output_path, effort=None, s
                            f'env_key="{MONITOR_KEY_ENV}",wire_api="responses"}}')]
     if effort is not None:
         command += ["-c", f'model_reasoning_effort="{effort}"']
+    tier = (cfg.get("monitor") or {}).get("service_tier")
+    if tier and not provider:
+        command += ["-c", f'service_tier="{tier}"']
     command += ["--output-schema", schema_path or os.path.join(TEMPLATES, "monitor-brief.schema.json"), "-o", output_path, "-"]
     return command
 

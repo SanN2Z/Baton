@@ -162,6 +162,11 @@ else:
         self.assertIn("--ephemeral", codex)
         self.assertIn("-s", codex)
         self.assertNotIn("model_reasoning_effort=\"None\"", codex)
+        self.assertFalse(any(item.startswith("service_tier=") for item in codex))
+        fast = baton._monitor_codex_command(self.project, dossier, self.cfg(service_tier="priority"),
+                                            str(Path(self.project.state_dir) / "out.json"), "ultra")
+        self.assertIn('service_tier="priority"', fast)
+        self.assertIn('model_reasoning_effort="ultra"', fast)
         self.assertEqual(baton._monitor_effort(cfg, "final"), "high")
         claude_cfg = self.cfg(model="haiku", reasoning_effort="medium")
         claude = baton._monitor_claude_command(self.project, dossier, claude_cfg, "medium")
