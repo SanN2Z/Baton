@@ -333,6 +333,31 @@ print("session_id: fake-session", file=sys.stderr)
         with self.assertRaises(baton.ConfigError):
             baton.hermes_preflight(project, cfg)
 
+    def test_preflight_counts_pool_credentials_of_the_executor_provider(self):
+        project = self._init()
+        cfg = project.config
+        profile = Path(baton.hermes_profile_dir(cfg))
+        (profile / ".env").write_text("", encoding="utf-8")
+        mirrored = {"providers": {"openai-codex": {"tokens": {"refresh_token": "r"},
+                                                   "last_auth_error": {"provider": "openai-codex"}}},
+                    "credential_pool": {"openai-codex": [{"id": "a", "auth_type": "oauth"}]}}
+        (profile / "auth.json").write_text(json.dumps(mirrored), encoding="utf-8")
+        baton.hermes_preflight(project, cfg)
+        mirrored["credential_pool"]["openai-codex"].append({"id": "b", "auth_type": "oauth"})
+        (profile / "auth.json").write_text(json.dumps(mirrored), encoding="utf-8")
+        with self.assertRaises(baton.ConfigError):
+            baton.hermes_preflight(project, cfg)
+        cfg["executor"]["provider"] = "deepseek"
+        with self.assertRaises(baton.ConfigError):
+            baton.hermes_preflight(project, cfg)
+        mirrored["credential_pool"]["deepseek"] = [{"id": "d", "auth_type": "api_key"}]
+        (profile / "auth.json").write_text(json.dumps(mirrored), encoding="utf-8")
+        baton.hermes_preflight(project, cfg)
+        mirrored["credential_pool"]["deepseek"].append({"id": "e", "auth_type": "api_key"})
+        (profile / "auth.json").write_text(json.dumps(mirrored), encoding="utf-8")
+        with self.assertRaises(baton.ConfigError):
+            baton.hermes_preflight(project, cfg)
+
     def test_state_db_terminal_calls_follow_compression_chain(self):
         project = self._init()
         cfg = project.config

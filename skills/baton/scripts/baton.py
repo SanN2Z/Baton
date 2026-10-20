@@ -5397,12 +5397,14 @@ def hermes_preflight(project, cfg):
     env_file = os.path.join(profile, ".env")
     if hermes_env_has_assignments(env_file):
         raise ConfigError(f"Hermes profile .env 非空，拒绝启动：{env_file}")
-    entries = _profile_credential_entries(os.path.join(profile, "auth.json"))
+    provider = executor_provider(cfg)
+    entries = _profile_provider_credentials(os.path.join(profile, "auth.json"), provider)
     if len(entries) != 1:
-        raise ConfigError(f"Hermes profile auth.json 必须恰好有一条 openai-codex 凭据，当前 {len(entries)} 条；请登录或删除多余条目")
-    account = hermes_account_ids(cfg)
-    if account["mismatch"]:
-        raise ConfigError("Hermes 与 Codex CLI 的账号 id 不一致，拒绝启动；请登录同一个账号")
+        raise ConfigError(f"Hermes profile auth.json 必须恰好有一条 {provider} 凭据，当前 {len(entries)} 条；请登录或删除多余条目")
+    if provider == "openai-codex":
+        account = hermes_account_ids(cfg)
+        if account["mismatch"]:
+            raise ConfigError("Hermes 与 Codex CLI 的账号 id 不一致，拒绝启动；请登录同一个账号")
     if ex.get("network_access"):
         command = [hermes_executable(cfg), "-p", ex.get("hermes_profile", "baton-exec-v2"), "tools", "list"]
         result = subprocess.run(command, env=_hermes_subprocess_env(cfg), capture_output=True, text=True)
@@ -6152,6 +6154,37 @@ def _profile_credential_entries(path):
 def _credential_identity(entry):
     if not isinstance(entry, dict):
         return ""
+def executor_provider(cfg):
+    """The Hermes provider the executor runs on (openai-codex unless baton.json says otherwise)."""
+    value = ((cfg.get("executor") or {}).get("provider") or "openai-codex")
+    return str(value).strip().lower().replace("_", "-") or "openai-codex"
+
+
+def _profile_provider_credentials(path, provider):
+    """Credentials Hermes holds for one provider in a profile auth.json.
+
+    Newer Hermes keeps one ``credential_pool`` list per provider and mirrors the active
+    OAuth login under ``providers``; counting both would see the same login twice, so the
+    pool is authoritative when present. Older files fall back to the legacy scan.
+    """
+    raw = read_json(path, None)
+    if not isinstance(raw, dict):
+        return []
+    pool = raw.get("credential_pool")
+    if isinstance(pool, dict) and provider in pool:
+        items = pool.get(provider)
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    if provider == "openai-codex":
+        return _profile_credential_entries(path)
+    found = []
+    for container in (raw.get("providers"), raw):
+        if isinstance(container, dict) and provider in container:
+            item = container[provider]
+            found.extend(x for x in (item if isinstance(item, list) else [item]) if isinstance(x, dict))
+            break
+    return found
+
+
     for key in ("account_id", "accountId", "chatgpt_account_id", "user_id", "userId", "email", "id"):
         value = entry.get(key)
         if isinstance(value, str) and value:
@@ -8547,10 +8580,11 @@ def doctor_hermes(project, cfg, line):
     check("OK" if read_text(config_path) == expected_config else "FAIL", "config.yaml 与模板一致")
     env_path = os.path.join(profile, ".env")
     check("OK" if not hermes_env_has_assignments(env_path) else "FAIL", ".env 为空或不存在")
-    entries = _profile_credential_entries(hermes_profile_auth_path(cfg))
+    provider = executor_provider(cfg)
+    entries = _profile_provider_credentials(hermes_profile_auth_path(cfg), provider)
     check("OK" if len(entries) == 1 else "FAIL",
-          f"profile auth.json：openai-codex 凭据 {len(entries)} 条（必须恰好 1 条）")
-    if len(entries) == 1:
+          f"profile auth.json：{provider} 凭据 {len(entries)} 条（必须恰好 1 条）")
+    if len(entries) == 1 and provider == "openai-codex":
         account = hermes_account_ids(cfg)
         profile_id, codex_id = account["profile"], account["codex"]
         if account["mismatch"]:
