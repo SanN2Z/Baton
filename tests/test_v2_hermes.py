@@ -400,7 +400,9 @@ print("session_id: fake-session", file=sys.stderr)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             baton.cmd_preset(project, Namespace(action="list", name=None, task=[]))
+        self.assertIn("模式：standard", out.getvalue())
         self.assertIn("* codex", out.getvalue())
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["preset"], "codex")
         self.assertIn("  deepseek", out.getvalue())
         before = path.read_text(encoding="utf-8")
         with self.assertRaises(baton.ConfigError):

@@ -214,8 +214,10 @@ def _latest_task(session):
 
 
 def idle_line(session):
-    mode = project_baton_json(session).get("mode") or "standard"
-    parts = [f"Baton v2·{mode}", "空闲"]
+    data = project_baton_json(session)
+    mode = data.get("mode") or "standard"
+    head = f"Baton v2·{mode}" + (f"·{data['preset']}" if isinstance(data.get("preset"), str) and data["preset"] else "")
+    parts = [head, "空闲"]
     latest = _latest_task(session)
     if latest:
         parts.append(f"最近 {latest[1]}·第{latest[2]}轮·{latest[3]}")

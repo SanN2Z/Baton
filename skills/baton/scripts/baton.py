@@ -5222,10 +5222,11 @@ def cmd_preset(project, args):
     if not isinstance(presets, dict):
         raise ConfigError("baton.json 的 presets 必须是 JSON object")
     if args.action == "list":
+        cfg = project.config
+        print(f"模式：{cfg.get('mode', 'standard')}（架构层，预设只换模型）")
         if not presets:
             print("baton.json 里没有 presets")
             return
-        cfg = project.config
         for name, preset in presets.items():
             mark = "*" if _preset_active(cfg, preset) else " "
             note = f"  {preset['description']}" if preset.get("description") else ""
@@ -5252,6 +5253,7 @@ def cmd_preset(project, args):
         section = {k: v for k, v in (new.get(role) or {}).items() if k not in keys}
         section.update({k: v for k, v in (preset.get(role) or {}).items() if k in keys})
         new[role] = section
+    new["preset"] = args.name
     path = project.baton_config_path
     previous = read_text(path)
     write_json(path, new)
