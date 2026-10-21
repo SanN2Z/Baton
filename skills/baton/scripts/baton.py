@@ -8978,7 +8978,10 @@ def run_monitor_probe(project, cfg, line):
     result = {"at": now(), "codex_global_instructions": None, "codex_dossier_read": False, "claude_ok": False}
     probe_dir = os.path.join(project.state_dir, "monitor-probe")
     os.makedirs(probe_dir, exist_ok=True)
-    root = tempfile.mkdtemp(prefix="baton-monitor-probe-")
+    # Not tempfile.mkdtemp: on Windows (Python 3.12.4+) it creates an owner-only ACL that the Codex
+    # unelevated sandbox cannot read. Real dossiers live under state_dir, so the probe does too.
+    root = os.path.join(probe_dir, "run-" + os.urandom(6).hex())
+    os.makedirs(root)
     try:
         dossier = os.path.join(root, "dossier")
         os.makedirs(os.path.join(dossier, "code"), exist_ok=True)
