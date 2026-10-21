@@ -7792,6 +7792,20 @@ def cmd_monitor(project, args):
     dossier = dossier_path(project, args.dossier)
     if not os.path.isdir(dossier):
         die(f"找不到卷宗 {args.dossier}")
+    if args.rerun and not os.path.isfile(os.path.join(dossier, "manifest.json")):
+        # A dossier whose build failed (e.g. invalid memory candidates) is rebuilt from the leg.
+        status = leg.get("executor_status") or leg.get("status")
+        if dossier_id_for(project, args.task, leg, status) != args.dossier:
+            die(f"卷宗 {args.dossier} 缺少 manifest，且不是当前轮次的卷宗，不能重建")
+        try:
+            rebuilt = build_dossier(project, args.task, st, leg, status)
+        except ConfigError as exc:
+            die(f"重建卷宗 {args.dossier} 失败：{exc}")
+        if rebuilt != args.dossier:
+            die(f"重建卷宗 {args.dossier} 失败：得到 {rebuilt}")
+        project.update_state(args.task, lambda s: current_leg(s).update(
+            dossier={"id": rebuilt, "type": dossier_type_for(status)}))
+        print(f"已重建卷宗 {args.dossier}")
     brief_path = project.p("reviews", args.dossier + "-brief.md")
     if os.path.exists(brief_path) and not args.rerun:
         die(f"卷宗 {args.dossier} 已有监督简报；需要重跑请加 --rerun")

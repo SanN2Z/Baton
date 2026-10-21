@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills" / "baton" / "scripts"))
@@ -362,6 +362,17 @@ class RulingTests(unittest.TestCase):
             baton.cmd_resume(self.project, Namespace(task="t", message="x", message_file=None, kind="回复",
                                                      verdict=None, decision=None, user_approved_continue=False,
                                                      _message_archived=False))
+
+    def test_monitor_rerun_rebuilds_dossier_missing_manifest(self):
+        dossier = self.make_dossier(kind="report")[0]
+        root = Path(baton.dossier_path(self.project, dossier))
+        baton._unseal_dossier(str(root))
+        (root / "manifest.json").unlink()
+        with patch.object(baton.platform_support, "detached_popen", return_value=Mock(pid=1)),                 contextlib.redirect_stdout(io.StringIO()) as output:
+            baton.cmd_monitor(self.project, Namespace(task="t", dossier=dossier, rerun=True, curate=False))
+        self.assertIn("已重建卷宗", output.getvalue())
+        self.assertTrue(baton.verify_dossier(self.project, dossier)[0])
+        self.assertEqual(baton.current_leg(self.project.load_state("t"))["dossier"]["id"], dossier)
 
     def test_close_abandon_without_final_dossier_records_and_prunes(self):
         report, _, _, _ = self.make_dossier(kind="report")
