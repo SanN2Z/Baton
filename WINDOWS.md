@@ -39,6 +39,26 @@ schemas are retained. v2 state and the shadow Git directory live outside the
 project, under `BATON_HOME/projects/<project-id>` (default `~/.baton/projects`).
 `BATON_HOME` must be outside the project. Relative paths in the shadow index use
 Git's forward slashes; files and subprocess text use UTF-8.
+
+To keep state on a larger drive, set `$env:BATON_HOME = 'D:/baton'` in PowerShell before
+running Baton. The default is `~/.baton`. When moving existing state, stop running tasks,
+move the old state directory's contents to the new directory, and keep the same setting
+for subsequent commands.
+Dossier `code/` copies omit untracked files ignored by the project's own Git rules;
+tracked files and non-Git projects retain their existing coverage. Omitted file/byte counts
+and the reason appear in `manifest.json` under `code_omissions`. Each new mid-leg check
+removes older check code copies for that task and leg. `baton close` removes all of the
+task's dossier code copies. Other records, the original manifest inventory, ledger bindings
+and rollback snapshots remain; `code_pruned` records the removal. Pruned dossiers retain
+record verification but cannot rerun a monitor.
+Use `baton gc --dry-run` to preview cleanup for already-closed tasks in the current project,
+then `baton gc` to remove their code copies and print dossier/file/byte counts.
+
+Read-only Codex monitor commands explicitly set `windows.sandbox="unelevated"`, including
+checks, briefs, curation and the doctor probe, because they ignore user config.
+`baton doctor --monitor-probe` requires an actual read of a sealed dossier's `charter.md`.
+An unreadable dossier is reported as a monitor infrastructure failure.
+
 Verification commands use Windows `cmd.exe` syntax. To run a POSIX verification
 command, explicitly invoke the absolute Git Bash executable and quote for cmd.
 `chmod` only supplies a read-only hint on Windows, not a Unix security boundary.

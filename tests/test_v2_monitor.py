@@ -183,7 +183,7 @@ else:
         bindir = Path(self.tmp.name) / "probe-bin"
         bindir.mkdir()
         codex = bindir / "codex"
-        codex.write_text("#!/usr/bin/env python3\nimport json,os,sys\nout=sys.argv[sys.argv.index('-o')+1]; mode=os.environ.get('BATON_PROBE_MODE','none')\nif mode == 'fail':\n print(json.dumps({'type':'turn.failed','error':{'message':'probe capacity'}})); sys.exit(1)\nopen(out,'w').write({'visible':'小标题','first':'# Global','none':'NONE'}[mode])\n", encoding="utf-8")
+        codex.write_text("#!/usr/bin/env python3\nimport json,os,sys\nout=sys.argv[sys.argv.index('-o')+1]; mode=os.environ.get('BATON_PROBE_MODE','none')\nif mode == 'fail':\n print(json.dumps({'type':'turn.failed','error':{'message':'probe capacity'}})); sys.exit(1)\nopen(out,'w',encoding='utf-8').write({'visible':'小标题','first':'# Global','none':'NONE'}[mode] + '\\n' + open('charter.md',encoding='utf-8').read())\n", encoding="utf-8")
         codex = executable_fixture(codex)
         claude = bindir / "claude"
         claude.write_text("#!/usr/bin/env python3\nimport json,sys\nschema=sys.argv[sys.argv.index('--json-schema')+1]\njson.loads(schema)\nprint(json.dumps({'type':'system','subtype':'init','tools':['Glob','Grep','Read','StructuredOutput'],'mcp_servers':[],'permissionMode':'dontAsk'}))\n", encoding="utf-8")
@@ -200,6 +200,7 @@ else:
             messages = []
             result = baton.run_monitor_probe(self.project, self.cfg(), lambda level, msg: messages.append((level, msg)))
         self.assertTrue(result["claude_ok"])
+        self.assertTrue(result["codex_dossier_read"])
         self.assertTrue(result["codex_global_instructions"])
         self.assertTrue(Path(result["codex_events"]).exists())
         self.assertTrue(Path(result["claude_stream"]).exists())

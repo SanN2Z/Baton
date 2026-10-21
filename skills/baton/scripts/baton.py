@@ -791,9 +791,10 @@ def _dossier_write(path, text, binary=False):
 
 
 def _dossier_code_snapshot(store, ref, target):
+    omissions = {"files": 0, "bytes": 0, "reason": "项目 git ignore 规则忽略的未跟踪文件"}
     os.makedirs(target, exist_ok=True)
     if not store or not ref:
-        return
+        return omissions
     proc = subprocess.Popen([platform_support.executable("git"), "-C", store.cwd, "archive", ref, ".", *code_excludes(store)],
                             env=store.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     data, err = proc.communicate()
@@ -804,7 +805,24 @@ def _dossier_code_snapshot(store, ref, target):
         with open(archive_path, "wb") as stream:
             stream.write(data)
         with tarfile.open(archive_path, "r") as archive:
-            for member in archive.getmembers():
+            members = archive.getmembers()
+            ignored = set()
+            if is_git(store.project.root):
+                # The user's index exempts tracked files; never use the shadow index here.
+                paths = [member.name for member in members if not member.isdir()]
+                if paths:
+                    p = subprocess.run([platform_support.executable("git"), "-C", store.project.root,
+                                        "check-ignore", "-z", "--stdin"], env=clean_git_env(),
+                                       input="".join(path + "\0" for path in paths),
+                                       capture_output=True, text=True, encoding="utf-8")
+                    if p.returncode not in (0, 1):
+                        raise RuntimeError("卷宗 git ignore 检查失败：" + p.stderr.strip()[:500])
+                    ignored = {path for path in p.stdout.split("\0") if path}
+            for member in members:
+                if member.name in ignored:
+                    omissions["files"] += 1
+                    omissions["bytes"] += member.size
+                    continue
                 name = member.name.replace("\\", "/")
                 if name.startswith(".baton/") or name == ".baton":
                     continue
@@ -817,6 +835,7 @@ def _dossier_code_snapshot(store, ref, target):
             os.remove(archive_path)
         except OSError:
             pass
+    return omissions
 
 
 def _dossier_files(root):
@@ -844,22 +863,25 @@ def dossier_manifest(project, dossier_id):
     return read_json(path, {}) or {}
 
 
-def verify_dossier(project, dossier_id):
+def verify_dossier(project, dossier_id, require_code=False):
     root = dossier_path(project, dossier_id)
     manifest = dossier_manifest(project, dossier_id)
     files = _dossier_files(root) if os.path.isdir(root) else {}
     expected = manifest.get("files") if isinstance(manifest, dict) else None
     if not isinstance(expected, dict):
         return False, "缺少卷宗 manifest"
-    if files != expected:
-        missing = sorted(set(expected) - set(files))
-        changed = sorted(k for k in set(expected) & set(files) if expected[k] != files[k])
-        extra = sorted(set(files) - set(expected))
+    if require_code and manifest.get("code_pruned"):
+        return False, "卷宗代码已清理，不能重跑 monitor"
+    retained = {k: v for k, v in expected.items() if not (manifest.get("code_pruned") and k.startswith("code/"))}
+    if files != retained:
+        missing = sorted(set(retained) - set(files))
+        changed = sorted(k for k in set(retained) & set(files) if retained[k] != files[k])
+        extra = sorted(set(files) - set(retained))
         detail = ", ".join(((["缺少 " + ",".join(missing)] if missing else []) +
                             (["改动 " + ",".join(changed)] if changed else []) +
                             (["新增 " + ",".join(extra)] if extra else [])))
         return False, "卷宗文件校验失败" + ("：" + detail if detail else "")
-    if manifest.get("total_sha256") != _dossier_total(files):
+    if manifest.get("total_sha256") != _dossier_total(expected):
         return False, "卷宗总哈希不匹配"
     return True, ""
 
@@ -888,6 +910,82 @@ def _unseal_dossier(root):
             os.chmod(directory, 0o755)
         except OSError:
             pass
+
+
+def _prune_dossier_code(project, dossier_id, reason, dry_run=False):
+    root = dossier_path(project, dossier_id)
+    code = os.path.join(root, "code")
+    if not os.path.isdir(code):
+        return None
+    if not os.path.realpath(code).startswith(os.path.realpath(root) + os.sep):
+        raise RuntimeError("卷宗 code 路径不在卷宗内：" + code)
+    sizes = [os.lstat(os.path.join(directory, name)).st_size
+             for directory, _, names in os.walk(code) for name in names]
+    removed = {"files": len(sizes), "bytes": sum(sizes), "reason": reason, "at": now()}
+    if not dry_run:
+        manifest = dossier_manifest(project, dossier_id)
+        if not manifest.get("files"):
+            raise RuntimeError("卷宗缺少文件清单，不能清理：" + dossier_id)
+        os.chmod(root, 0o755)
+        try:
+            _unseal_dossier(code)
+            shutil.rmtree(code)
+            # Keep the original inventory/hash so existing ledger bindings still resolve.
+            manifest["code_pruned"] = removed
+            os.chmod(os.path.join(root, "manifest.json"), 0o644)
+            write_json(os.path.join(root, "manifest.json"), manifest)
+        finally:
+            _seal_dossier(root)
+    return removed
+
+
+def task_dossiers(project, task, st):
+    """Find both current manifests and pre-retention dossiers recorded in task state/ledger."""
+    known = {record["dossier"] for record in ledger_records(project)
+             if record.get("task") == task and record.get("dossier")}
+    for leg in st.get("legs", []):
+        for key in ("dossier", "monitor", "monitor_check", "last_check"):
+            value = leg.get(key) or {}
+            ident = value.get("id") or value.get("dossier")
+            if ident:
+                known.add(ident)
+        if leg.get("check_dossier"):
+            known.add(leg["check_dossier"])
+    base = os.path.join(project.state_dir, "dossiers")
+    if not os.path.isdir(base):
+        return []
+    found = []
+    pattern = re.escape(task) + r"-(?:final(?:-\d+)?|leg-\d+(?:-(?:violation|c\d+))?|curate-\d+|seed)"
+    for ident in sorted(os.listdir(base)):
+        if ident.endswith(".out") or not os.path.isdir(os.path.join(base, ident)):
+            continue
+        manifest = dossier_manifest(project, ident)
+        owner = manifest.get("task")
+        if owner == task or (not owner and (ident in known or re.fullmatch(pattern, ident))):
+            found.append(ident)
+    return found
+
+
+def prune_closed_task(project, task, dry_run=False):
+    st = project.load_state(task)
+    if st.get("status") != "closed":
+        return []
+    removed = []
+    for ident in task_dossiers(project, task, st):
+        result = _prune_dossier_code(project, ident, "任务已 closed", dry_run=dry_run)
+        if result is not None:
+            removed.append(result)
+            print(f"{'将清理' if dry_run else '已清理'} {ident}/code/：{result['files']} 个文件，{result['bytes']} 字节")
+    return removed
+
+
+def cmd_gc(project, args):
+    project.require_init()
+    removed = []
+    for task in project.tasks():
+        removed.extend(prune_closed_task(project, task, dry_run=args.dry_run))
+    print(f"{'将清理' if args.dry_run else '已清理'} {len(removed)} 份卷宗代码，"
+          f"{sum(item['files'] for item in removed)} 个文件，{sum(item['bytes'] for item in removed)} 字节")
 
 
 def _charter_text(project, task, st):
@@ -1092,7 +1190,7 @@ def build_dossier(project, task, st, leg, status):
     if store and baseline and leg.get("end_ref"):
         diff_text = store.git("diff", "--binary", baseline, leg["end_ref"], "--", ".", *code_excludes(store), check=False)
     _dossier_write(os.path.join(root, "diff.patch"), diff_text)
-    _dossier_code_snapshot(store, leg.get("end_ref"), os.path.join(root, "code"))
+    omissions = _dossier_code_snapshot(store, leg.get("end_ref"), os.path.join(root, "code"))
     artifact = ((leg.get("result") or {}).get("artifact") if isinstance(leg.get("result"), dict) else "") or ""
     report_text = ""
     if artifact and os.path.isfile(artifact):
@@ -1104,7 +1202,8 @@ def build_dossier(project, task, st, leg, status):
     _dossier_write(os.path.join(root, "memory.md"), _memory_dossier_text(project, task, st, leg, candidates))
     _dossier_write(os.path.join(root, "precedents.md"), precedents)
     files = _dossier_files(root)
-    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "type": kind, "files": files,
+    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "task": task, "leg": leg.get("n"),
+        "type": kind, "code_omissions": omissions, "files": files,
         "total_sha256": _dossier_total(files), "created_at": now()})
     _seal_dossier(root)
     return dossier_id
@@ -1163,11 +1262,13 @@ def build_curation_dossier(project, task):
     leg = current_leg(st) or {"n": 0, "events": "", "started_at": now()}
     _dossier_write(os.path.join(root, "evidence.md"), _evidence_text(project, task, st, leg, "curation", st.get("base_ref")))
     store = project.store(task, st)
+    omissions = {"files": 0, "bytes": 0, "reason": "项目 git ignore 规则忽略的未跟踪文件"}
     if store and (leg.get("end_ref") or st.get("base_ref")):
-        _dossier_code_snapshot(store, leg.get("end_ref") or st.get("base_ref"), os.path.join(root, "code"))
+        omissions = _dossier_code_snapshot(store, leg.get("end_ref") or st.get("base_ref"), os.path.join(root, "code"))
     _dossier_write(os.path.join(root, "diff.patch"), "")
     files = _dossier_files(root)
-    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "type": "curation",
+    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "task": task, "leg": leg.get("n"),
+        "type": "curation", "code_omissions": omissions,
         "files": files, "total_sha256": _dossier_total(files), "created_at": now()})
     _seal_dossier(root)
     return dossier_id
@@ -1367,6 +1468,7 @@ def _monitor_codex_command(project, dossier_id, cfg, output_path, effort=None, s
     command = [platform_support.executable("codex"), "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                "--skip-git-repo-check", "-s", "read-only", "-C", dossier_path(project, dossier_id),
                "-m", model]
+    command += platform_support.codex_readonly_config()
     if effort is not None:
         command += ["-c", f'model_reasoning_effort="{effort}"']
     command += ["--output-schema", schema_path or os.path.join(TEMPLATES, "monitor-brief.schema.json"), "-o", output_path, "-"]
@@ -1407,6 +1509,41 @@ def _monitor_result_from_files(project, dossier_id, model, output_path, stdout):
         return None, "Claude 输出缺少 structured_output"
     value = read_json(output_path)
     return (value, "") if value is not None else (None, "Codex 没有写出 JSON 简报")
+
+
+def _monitor_read_error(value, diagnostics=""):
+    """An unreadable dossier is a monitor failure, never evidence of executor drift."""
+    for line in diagnostics.splitlines():
+        if "blocked by policy" not in line.lower():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return "monitor 基础设施错误：卷宗读取被策略阻止（blocked by policy）"
+        if isinstance(event, dict):
+            item = event.get("item") or {}
+            if event.get("type") in ("error", "turn.failed") or event.get("error") or (
+                    isinstance(item, dict) and item.get("type") == "command_execution" and
+                    (item.get("status") == "failed" or item.get("exit_code") not in (None, 0))):
+                return "monitor 基础设施错误：卷宗读取被策略阻止（blocked by policy）"
+    texts = [value.get("summary", "")] if isinstance(value, dict) else []
+    findings = value.get("findings") if isinstance(value, dict) else None
+    if isinstance(findings, list):
+        for finding in findings:
+            if isinstance(finding, dict):
+                texts.append(json.dumps(finding, ensure_ascii=False))
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        lower = text.lower()
+        dossier = any(word in lower for word in ("dossier", "卷宗", "charter.md", "evidence.md",
+                      "manifest.json", "monitor_prompt.md", "precedents.md", "memory.md"))
+        unreadable = re.search(r"cannot read|can't read|could not read|unable to (?:read|access)|failed to read|"
+                               r"blocked by policy|permission denied|access denied|无法(?:读取|访问)|不能读取|"
+                               r"未能读取|读取失败|拒绝访问|策略阻止", lower)
+        if dossier and unreadable:
+            return "monitor 基础设施错误：无法读取卷宗；" + text[:500]
+    return ""
 
 
 def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n=None):
@@ -1480,11 +1617,17 @@ def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n
             stream.write(stderr or "")
     else:
         stderr = read_text(stderr_path)
+    read_error = _monitor_read_error(None, read_text(events_path) + "\n" + stderr + "\n" + (stdout or ""))
+    if read_error:
+        return None, read_error, attempt, "infrastructure"
     if proc.returncode != 0:
         if is_capacity_failure(events_path, stderr_path, returncode=proc.returncode):
             return None, "monitor 容量不足", attempt, "capacity"
         return None, (stderr or "monitor 进程失败").strip()[-1000:], attempt, "process"
     value, error = _monitor_result_from_files(project, dossier_id, model, output_path, stdout)
+    read_error = _monitor_read_error(value)
+    if read_error:
+        return None, read_error, attempt, "infrastructure"
     if error:
         return None, error, attempt, None
     if curation:
@@ -1558,6 +1701,9 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
         _dossier_write(stderr_path, stderr or "")
     else:
         stderr = read_text(stderr_path)
+    read_error = _monitor_read_error(None, read_text(events_path) + "\n" + stderr + "\n" + (stdout or ""))
+    if read_error:
+        return None, read_error, attempt, "infrastructure"
     if proc.returncode != 0:
         if is_capacity_failure(events_path, stderr_path, returncode=proc.returncode):
             return None, "轮中检查容量不足", attempt, "capacity"
@@ -1570,6 +1716,9 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
         value = wrapper.get("structured_output") if isinstance(wrapper, dict) else None
     else:
         value = read_json(output_path)
+    read_error = _monitor_read_error(value)
+    if read_error:
+        return None, read_error, attempt, "infrastructure"
     if not isinstance(value, dict):
         return None, "轮中检查没有写出 JSON", attempt, None
     errors = _validate_monitor_check(value, (cfg.get("supervision") or {}).get("check_summary_max_chars", 300))
@@ -1610,7 +1759,7 @@ def run_monitor_check_lifecycle(project, task, dossier_id, cfg, leg_n):
     for schema_attempt in range(2):
         prompt = base_prompt if schema_attempt == 0 else base_prompt + "\n\n---\n\n# 上次输出的校验错误\n" + "\n".join(errors)
         while True:
-            good, integrity_error = verify_dossier(project, dossier_id)
+            good, integrity_error = verify_dossier(project, dossier_id, require_code=True)
             if not good:
                 _check_failure_update(project, task, leg_n, dossier_id, integrity_error)
                 return False
@@ -1624,6 +1773,9 @@ def run_monitor_check_lifecycle(project, task, dossier_id, cfg, leg_n):
                                                           immediate_used + delayed_used, phase):
                     continue
             errors = [error or "轮中检查失败"]
+            if failure_kind == "infrastructure":
+                _check_failure_update(project, task, leg_n, dossier_id, error)
+                return False
             break
         if not errors:
             break
@@ -1652,6 +1804,10 @@ def _persist_leg_stop_reason(project, task, leg_n, reason):
 
 def apply_monitor_check_result(project, task, dossier_id, value, leg_n):
     """Persist a successful check and apply its conclusion to the running leg."""
+    error = _monitor_read_error(value)
+    if error:
+        _check_failure_update(project, task, leg_n, dossier_id, error)
+        return False
     conclusion = value.get("conclusion")
     brief_path = ""
     if conclusion in {"drifting", "breaking"}:
@@ -1908,12 +2064,12 @@ def run_monitor_lifecycle(project, task, dossier_id, dossier_kind, cfg, leg_n, o
         capacity_error = None
         terminal_error = None
         while True:
-            good, integrity_error = verify_dossier(project, dossier_id)
+            good, integrity_error = verify_dossier(project, dossier_id, require_code=True)
             if not good:
                 _monitor_state_update(project, task, dossier_id, leg_n, "failed", error=integrity_error)
                 return False
             brief, error, attempt, failure_kind = run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n)
-            if brief is None and failure_kind in ("timeout", "process"):
+            if brief is None and failure_kind in ("timeout", "process", "infrastructure"):
                 terminal_error = error or "monitor 进程失败"
                 break
             if brief is None and failure_kind == "capacity":
@@ -1934,7 +2090,7 @@ def run_monitor_lifecycle(project, task, dossier_id, dossier_kind, cfg, leg_n, o
             errors = [terminal_error]
             break
         if brief is not None:
-            good, integrity_error = verify_dossier(project, dossier_id)
+            good, integrity_error = verify_dossier(project, dossier_id, require_code=True)
             if not good:
                 _monitor_state_update(project, task, dossier_id, leg_n, "failed", error=integrity_error)
                 return False
@@ -2051,6 +2207,12 @@ def build_check_dossier(project, task, st, leg):
     seq = int(leg.get("check_seq", 0) or 0) + 1
     dossier_id = f"{task}-leg-{leg['n']:03d}-c{seq:02d}"
     root = dossier_path(project, dossier_id)
+    prefix = f"{task}-leg-{leg['n']:03d}-c"
+    base = os.path.join(project.state_dir, "dossiers")
+    if os.path.isdir(base):
+        for previous in sorted(os.listdir(base)):
+            if previous != dossier_id and re.fullmatch(re.escape(prefix) + r"\d+", previous):
+                _prune_dossier_code(project, previous, "同一轮已建立新的检查卷宗")
     if os.path.exists(root):
         _unseal_dossier(root)
         shutil.rmtree(root)
@@ -2064,9 +2226,10 @@ def build_check_dossier(project, task, st, leg):
     _dossier_write(os.path.join(root, "evidence.md"), _check_evidence_text(project, task, st, leg, baseline, probe_ref))
     diff_text = store.git("diff", "--binary", baseline, probe_ref, "--", ".", *code_excludes(store), check=False) if baseline else ""
     _dossier_write(os.path.join(root, "diff.patch"), diff_text)
-    _dossier_code_snapshot(store, probe_ref, os.path.join(root, "code"))
+    omissions = _dossier_code_snapshot(store, probe_ref, os.path.join(root, "code"))
     files = _dossier_files(root)
-    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "type": "check", "files": files,
+    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "task": task, "leg": leg.get("n"),
+        "type": "check", "code_omissions": omissions, "files": files,
         "total_sha256": _dossier_total(files), "created_at": now()})
     _seal_dossier(root)
     def mark(state):
@@ -2963,11 +3126,7 @@ class Project:
 
     @property
     def state_dir(self):
-        home = os.environ.get("BATON_HOME") or "~/.baton"
-        expanded = os.path.expanduser(home)
-        if "${" in home or not os.path.isabs(expanded):
-            expanded = os.path.expanduser("~/.baton")
-        return os.path.join(os.path.abspath(expanded), "projects", self.project_id)
+        return os.path.join(memory_baton_home(), "projects", self.project_id)
 
     @property
     def snap_git_dir(self):
@@ -3704,7 +3863,7 @@ def build_seed_dossier(project, task):
     _dossier_write(os.path.join(root, "memory.md"), _memory_dossier_text(project, task, st,
                    current_leg(st) or {"memory_core": ""}, candidates))
     files = _dossier_files(root)
-    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "type": "seed", "files": files,
+    write_json(os.path.join(root, "manifest.json"), {"dossier": dossier_id, "task": task, "type": "seed", "files": files,
         "total_sha256": _dossier_total(files), "created_at": now()})
     _seal_dossier(root)
     project.update_state(task, lambda s: (current_leg(s) or {}).update(
@@ -5768,9 +5927,7 @@ def memory_baton_home(cfg=None):
     """Resolve BATON_HOME without consulting the user's real home in tests."""
     explicit = os.environ.get("BATON_HOME")
     if explicit and "${" not in explicit:
-        expanded = os.path.expanduser(explicit)
-        if os.path.isabs(expanded):
-            return os.path.abspath(expanded)
+        return os.path.abspath(os.path.expanduser(explicit))
     project = (cfg or {}).get("project") if isinstance(cfg, dict) else None
     state = project.get("state_dir") if isinstance(project, dict) else None
     if state:
@@ -8011,6 +8168,7 @@ def cmd_close(project, args):
     rows = _close_rejected_findings(project, task, ledger_records(project))
     project.update_state(task, lambda s: s.update(status="closed", closed={"dossier": dossier_id,
         "verdict_seq": verdict.get("seq"), "ledger_seq": record.get("seq"), "at": now()}))
+    prune_closed_task(project, task)
     print(f"任务 {task} 已 closed（终审 {dossier_id}，ACCEPT seq {verdict.get('seq')}）。")
     print("整个任务被驳回的偏离：")
     if rows:
@@ -8817,13 +8975,16 @@ def _probe_candidate_lines(lines):
 
 def run_monitor_probe(project, cfg, line):
     """Run the opt-in Codex/Claude isolation probes used by dossier evidence."""
-    result = {"at": now(), "codex_global_instructions": None, "claude_ok": False}
+    result = {"at": now(), "codex_global_instructions": None, "codex_dossier_read": False, "claude_ok": False}
     probe_dir = os.path.join(project.state_dir, "monitor-probe")
     os.makedirs(probe_dir, exist_ok=True)
     root = tempfile.mkdtemp(prefix="baton-monitor-probe-")
     try:
         dossier = os.path.join(root, "dossier")
         os.makedirs(os.path.join(dossier, "code"), exist_ok=True)
+        read_token = "BATON_DOSSIER_READ_" + os.urandom(16).hex()
+        _dossier_write(os.path.join(dossier, "charter.md"), read_token + "\n")
+        _seal_dossier(dossier)
         output = os.path.join(root, "codex.last.txt")
         monitor_cfg = dict(cfg)
         monitor_cfg["monitor"] = dict(cfg.get("monitor") or {}, model=(cfg.get("monitor") or {}).get("model", "gpt-5.6-sol"))
@@ -8847,12 +9008,13 @@ def run_monitor_probe(project, cfg, line):
         result.update(codex_events=events_path, codex_last=last_path, codex_stderr=stderr_path)
         for raw_path in (events_path, last_path, stderr_path):
             Path(raw_path).touch()
-        codex_prompt = ("如果你收到的指令中出现下面给出的第一行，请原样输出其后前三个候选行中的任意一行；"
-                        "HTML 注释和只有标点的行不算候选。如果看不到这第一行，或没有候选行，就只输出 NONE。\n"
+        codex_prompt = ("先用文件读取工具读取当前目录的 charter.md，原样输出其内容；内容只在文件里，不能猜测。\n"
+                        "然后，如果你收到的指令中出现下面给出的第一行，请原样输出其后前三个候选行中的任意一行；"
+                        "HTML 注释和只有标点的行不算候选。如果看不到这第一行，或没有候选行，第二部分只输出 NONE。\n"
                         f"第一行：{first}")
         command = [platform_support.executable("codex"), "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                    "--skip-git-repo-check", "-s", "read-only", "-C", dossier,
-                   "-m", monitor_model, "-o", output, "-"]
+                   "-m", monitor_model, *platform_support.codex_readonly_config(), "-o", output, "-"]
         try:
           if not result.get("codex_skipped"):
             p = subprocess.run(command, cwd=dossier, input=codex_prompt, text=True,
@@ -8883,6 +9045,14 @@ def run_monitor_probe(project, cfg, line):
                 result["codex_error"] = failure_text[:1000]
                 line("FAIL", "Codex 探针没能运行：" + result["codex_error"])
             else:
+                result["codex_dossier_read"] = read_token in last_message
+                read_error = _monitor_read_error(None, (p.stdout or "") + "\n" + (p.stderr or ""))
+                if not result["codex_dossier_read"] or read_error:
+                    result["codex_dossier_read"] = False
+                    result["codex_error"] = read_error or "未能读出卷宗 charter.md 中的内容"
+                    line("FAIL", "Codex monitor 卷宗读取探针失败：" + result["codex_error"])
+                else:
+                    line("OK", "Codex monitor 卷宗读取探针：已读出 charter.md")
                 normalized_output = _probe_normalize_line(last_message)
                 if candidates and any(_probe_normalize_line(candidate) in normalized_output for candidate in candidates):
                     result["codex_global_instructions"] = True
@@ -8946,7 +9116,8 @@ def run_monitor_probe(project, cfg, line):
             line("FAIL", "Claude monitor 探针失败：" + str(e))
             result["claude_error"] = str(e)
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        _unseal_dossier(root)
+        shutil.rmtree(root)
     return result
 
 
@@ -9005,6 +9176,8 @@ def main():
     s.add_argument("task")
     s = sub.add_parser("close", help="验收通过后关闭任务")
     s.add_argument("task")
+    s = sub.add_parser("gc", help="清理已 closed 任务的卷宗代码，保留记录和账本")
+    s.add_argument("--dry-run", action="store_true", help="只列出将清理的卷宗、文件数和字节数")
     s = sub.add_parser("supervised", help="记录一次监管结论并重置计时")
     s.add_argument("task")
     s.add_argument("--verdict", choices=["on_track", "drifting", "breaking"])
@@ -9069,7 +9242,7 @@ def main():
     home = os.environ.get("BATON_HOME")
     if home:
         expanded_home = os.path.expanduser(home)
-        if "${" in home or not os.path.isabs(expanded_home):
+        if "${" in home:
             os.environ["BATON_HOME"] = os.path.abspath(os.path.expanduser("~/.baton"))
         else:
             os.environ["BATON_HOME"] = os.path.abspath(expanded_home)
@@ -9084,7 +9257,7 @@ def main():
     handler = {
         "init": cmd_init, "statusline": cmd_statusline, "new": cmd_new, "start": cmd_start,
         "resume": cmd_resume, "steer": cmd_steer, "wait": cmd_wait, "monitor": cmd_monitor, "status": cmd_status,
-        "close": cmd_close,
+        "close": cmd_close, "gc": cmd_gc,
         "supervised": cmd_supervised, "stop": cmd_stop, "checkpoint": cmd_checkpoint, "refs": cmd_refs,
         "diff": cmd_diff, "rollback": cmd_rollback, "list": cmd_list, "config": cmd_config, "quota": cmd_quota,
         "doctor": cmd_doctor, "memory": cmd_memory, "restore-frozen": cmd_restore_frozen, "amend": cmd_amend, "_run": cmd_run,

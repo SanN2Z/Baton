@@ -340,6 +340,7 @@ class RulingTests(unittest.TestCase):
     def test_close_success_lists_rejected_findings_and_closed_blocks_resume(self):
         finding = {"id": "F1", "category": "out_of_scope", "severity": "blocking", "description": "d",
                    "evidence": [], "rule_source": "r"}
+        report, _, _, _ = self.make_dossier(kind="report")
         dossier, _, _, _ = self.make_dossier(kind="final", findings=[finding])
         self.rule(dossier, "ACCEPT", {"F1": {"decision": "reject", "reason": "保留记录"}})
         self.project.update_state("t", lambda s: baton.current_leg(s).update(
@@ -349,6 +350,14 @@ class RulingTests(unittest.TestCase):
             baton.cmd_close(self.project, Namespace(task="t"))
         self.assertIn("已 closed", output.getvalue())
         self.assertIn("F1 · out_of_scope · blocking", output.getvalue())
+        root = Path(baton.dossier_path(self.project, dossier))
+        self.assertFalse((root / "code").exists())
+        self.assertFalse((Path(baton.dossier_path(self.project, report)) / "code").exists())
+        self.assertTrue((root / "charter.md").exists())
+        self.assertTrue(baton.verify_dossier(self.project, dossier)[0])
+        self.assertTrue(baton.verify_ledger(self.project))
+        brief, _ = baton._dossier_brief(self.project, "t", dossier)
+        self.assertIsNotNone(brief)
         with self.assertRaises(SystemExit):
             baton.cmd_resume(self.project, Namespace(task="t", message="x", message_file=None, kind="回复",
                                                      verdict=None, decision=None, user_approved_continue=False,

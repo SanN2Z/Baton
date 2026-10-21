@@ -19,6 +19,11 @@ def utf8_stdio():
                 stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def codex_readonly_config():
+    """Read-only monitors ignore user config, including the Windows sandbox choice."""
+    return ["-c", 'windows.sandbox="unelevated"'] if os.name == "nt" else []
+
+
 def executable(name):
     """Windows must never execute npm .cmd/.ps1 shims (TOML quoting is lost)."""
     if os.name != "nt":
