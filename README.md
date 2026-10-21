@@ -129,3 +129,7 @@ baton init --migrate
 1. ParadoxZW. *council.skill*. GitHub, 2026. <https://github.com/ParadoxZW/council.skill>
 2. Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, Deshraj Yadav. *Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory*. arXiv:2504.19413, 2025. <https://arxiv.org/abs/2504.19413>
 3. Soumil Rathi, Deshraj Yadav, Taranjeet Singh. *DolphinBench: Mapping the Pareto Frontier of Agent Memory*. arXiv:2609.24971, 2026. <https://arxiv.org/abs/2609.24971>
+
+## Windows
+
+Native Windows 11 support uses Codex as executor and monitor, with local memory by default. Hermes is unsupported on Windows. See [WINDOWS.md](WINDOWS.md) for installation, process behavior, and v1/v2 coexistence.

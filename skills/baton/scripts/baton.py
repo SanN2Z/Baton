@@ -29,6 +29,10 @@ import time
 import tarfile
 import xml.etree.ElementTree as ET
 
+import baton_platform as platform_support
+
+platform_support.utf8_stdio()
+
 try:
     import fcntl
 except ImportError:
@@ -127,17 +131,16 @@ def deep_merge(base, over):
 
 def read_json(path, default=None):
     try:
-        with open(path) as f:
-            return json.load(f)
+        return json.loads(platform_support.read_text(path))
     except Exception:
         return default
 
 
 def write_json(path, data):
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    platform_support.atomic_replace(tmp, path)
 
 
 def write_json_keep(path, data):
@@ -149,17 +152,16 @@ def write_json_keep(path, data):
         mode = None
     tmp = f"{real}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # never readable by others mid-write
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.chmod(tmp, mode if mode is not None else 0o644)
-    os.replace(tmp, real)
+    platform_support.replace_readonly(tmp, real)
 
 
 def read_text(path, default=""):
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
+        return platform_support.read_text(path)
     except OSError:
         return default
 
@@ -184,9 +186,11 @@ def read_bytes_since(path, offset):
 
 
 def proc_cmdline(pid):
+    if os.name == "nt":
+        return platform_support.proc_cmdline(pid)
     try:
         return subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                              capture_output=True, text=True).stdout.strip()
+                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
     except OSError:
         return ""
 
@@ -195,6 +199,8 @@ def pid_alive(pid, marker=None):
     """Process exists (and, with `marker`, its command line contains it: guards PID reuse)."""
     if not pid:
         return False
+    if os.name == "nt":
+        return platform_support.pid_alive(pid) and (marker is None or marker in proc_cmdline(pid))
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -365,7 +371,7 @@ def validate_config(cfg):
 
 
 def run(cmd, cwd=None, env=None, check=True, input_text=None):
-    p = subprocess.run(cmd, cwd=cwd, env=env, input=input_text, capture_output=True, text=True)
+    p = subprocess.run(cmd, cwd=cwd, env=env, input=input_text, capture_output=True, text=True, encoding="utf-8")
     if check and p.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed: {p.stderr.strip()[:400]}")
     return p.stdout
@@ -381,14 +387,14 @@ def safe_quota(block=True, notify=False):
 # ---------------------------------------------------------------- git checkpoints
 
 def is_git(root):
-    p = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
-                       capture_output=True, text=True, env=clean_git_env())
+    p = subprocess.run([platform_support.executable("git"), "-C", root, "rev-parse", "--is-inside-work-tree"],
+                       capture_output=True, text=True, env=clean_git_env(), encoding="utf-8")
     return p.returncode == 0 and p.stdout.strip() == "true"
 
 
 def git(root, *args, env=None, check=True, input_text=None):
     """git in the user's own repository (statusline helpers and v1 tasks)."""
-    return run(["git", "-C", root, *args], env=env if env is not None else clean_git_env(),
+    return run([platform_support.executable("git"), "-C", root, *args], env=env if env is not None else clean_git_env(),
                check=check, input_text=input_text)
 
 
@@ -437,8 +443,8 @@ def snapshot(root, message):
             git(top, "update-index", "--no-skip-worktree", "-z", "--stdin", env=env,
                 check=False, input_text="".join(p + "\0" for p in skipped))
         for attempt in range(5):
-            p = subprocess.run(["git", "-C", top, "add", "-A", "--ignore-errors"], env=env,
-                               capture_output=True, text=True)
+            p = subprocess.run([platform_support.executable("git"), "-C", top, "add", "-A", "--ignore-errors"], env=env,
+                               capture_output=True, text=True, encoding="utf-8")
             if p.returncode in (0, 1):  # 1: some files unreadable, the rest was added
                 if p.returncode == 1:
                     print(f"baton: 快照时有文件无法读取，已跳过：{p.stderr.strip()[:300]}", file=sys.stderr)
@@ -472,7 +478,9 @@ def clean_git_env(extra=None):
 
 def _locked(path):
     """Open path for an exclusive flock; use as a context manager."""
-    f = open(path, "w")
+    if os.name == "nt":
+        return platform_support.exclusive_lock(path)
+    f = open(path, "a+b")
     if fcntl:
         fcntl.flock(f, fcntl.LOCK_EX)
     return f
@@ -521,20 +529,20 @@ def ensure_shadow(project):
         tmp = f"{gd}.tmp-{os.getpid()}"
         shutil.rmtree(tmp, ignore_errors=True)
         env = clean_git_env()
-        run(["git", "init", "-q", "--bare", tmp], env=env)
+        run([platform_support.executable("git"), "init", "-q", "--bare", tmp], env=env)
         # store working-tree bytes exactly: no end-of-line conversion or filters on the way in or out
-        run(["git", "--git-dir", tmp, "config", "core.autocrlf", "false"], env=env)
+        run([platform_support.executable("git"), "--git-dir", tmp, "config", "core.autocrlf", "false"], env=env)
         # git probed case sensitivity where snap.git lives; the project's own volume is what counts
         probe_dir = project.dir if os.path.isdir(project.dir) else project.root
         ignorecase = _probe_ignorecase(probe_dir) if os.path.isdir(probe_dir) else None
         if ignorecase is not None:
-            run(["git", "--git-dir", tmp, "config", "core.ignorecase", "true" if ignorecase else "false"], env=env)
+            run([platform_support.executable("git"), "--git-dir", tmp, "config", "core.ignorecase", "true" if ignorecase else "false"], env=env)
         os.makedirs(os.path.join(tmp, "info"), exist_ok=True)
-        with open(os.path.join(tmp, "info", "attributes"), "w") as f:
+        with open(os.path.join(tmp, "info", "attributes"), "w", encoding="utf-8") as f:
             f.write("* -text -filter -ident -working-tree-encoding\n")
         exclude = os.path.join(tmp, "info", "exclude")
         text = read_text(exclude)
-        with open(exclude, "a") as f:
+        with open(exclude, "a", encoding="utf-8") as f:
             f.write(("\n" if text and not text.endswith("\n") else "")
                     + SHADOW_EXCLUDE_MARK + "\n" + "\n".join(SHADOW_EXCLUDE_DEFAULTS) + "\n")
         os.rename(tmp, gd)
@@ -571,7 +579,7 @@ class SnapStore:
         return env
 
     def git(self, *args, env=None, check=True, input_text=None, cwd=None):
-        return run(["git", "-C", cwd or self.cwd, *args], env=self.env(env), check=check, input_text=input_text)
+        return run([platform_support.executable("git"), "-C", cwd or self.cwd, *args], env=self.env(env), check=check, input_text=input_text)
 
     def has_commit(self, rev):
         if self.kind == "shadow" and not os.path.isdir(self.git_dir):
@@ -584,13 +592,13 @@ class SnapStore:
         Read-only: `git ls-files` reads the user's index and writes nothing.  Empty when the
         project is not inside a git repository.
         """
-        p = subprocess.run(["git", "-C", self.project.root, "ls-files", "-z", "--", "."],
-                           env=clean_git_env(), capture_output=True, text=True)
+        p = subprocess.run([platform_support.executable("git"), "-C", self.project.root, "ls-files", "-z", "--", "."],
+                           env=clean_git_env(), capture_output=True, text=True, encoding="utf-8")
         return {x for x in p.stdout.split("\0") if x} if p.returncode == 0 else set()
 
     def user_gitlinks(self):
-        p = subprocess.run(["git", "-C", self.project.root, "ls-files", "-s", "-z", "--", "."],
-                           env=clean_git_env(), capture_output=True, text=True)
+        p = subprocess.run([platform_support.executable("git"), "-C", self.project.root, "ls-files", "-s", "-z", "--", "."],
+                           env=clean_git_env(), capture_output=True, text=True, encoding="utf-8")
         links = set()
         for item in p.stdout.split("\0"):
             if item.startswith("160000 ") and "\t" in item:
@@ -615,14 +623,14 @@ class SnapStore:
             if os.path.exists(stale_lock):
                 os.remove(stale_lock)  # every Baton writer holds snap.lock, so this one is left over
             tracked = self.user_tracked()
-            now_ignored = [x for x in run(["git", "-C", top, "ls-files", "-z", "-ci", "--exclude-standard"],
+            now_ignored = [x for x in run([platform_support.executable("git"), "-C", top, "ls-files", "-z", "-ci", "--exclude-standard"],
                                           env=env).split("\0") if x and x not in tracked]
             if now_ignored:
-                run(["git", "-C", top, "update-index", "--force-remove", "-z", "--stdin"], env=env,
+                run([platform_support.executable("git"), "-C", top, "update-index", "--force-remove", "-z", "--stdin"], env=env,
                     input_text="".join(x + "\0" for x in now_ignored))
             for attempt in range(5):
-                p = subprocess.run(["git", "-C", top, "add", "-A", "--ignore-errors"], env=env,
-                                   capture_output=True, text=True)
+                p = subprocess.run([platform_support.executable("git"), "-C", top, "add", "-A", "--ignore-errors"], env=env,
+                                   capture_output=True, text=True, encoding="utf-8")
                 if p.returncode in (0, 1):  # 1: some files unreadable, the rest was added
                     if p.returncode == 1:
                         print(f"baton: 快照时有文件无法读取，已跳过：{p.stderr.strip()[:300]}", file=sys.stderr)
@@ -631,7 +639,7 @@ class SnapStore:
             else:
                 raise RuntimeError(f"git add -A 失败：{p.stderr.strip()[:300]}")
             if tracked:
-                have = set(run(["git", "-C", top, "ls-files", "-z"], env=env).split("\0"))
+                have = set(run([platform_support.executable("git"), "-C", top, "ls-files", "-z"], env=env).split("\0"))
                 gitlinks = self.user_gitlinks()
                 forced = []
                 skipped = []
@@ -647,20 +655,20 @@ class SnapStore:
                 if skipped:
                     print("baton: 强制加入时跳过：" + "，".join(skipped[:20]), file=sys.stderr)
                 if forced:
-                    add_cmd = ["git", "-C", top, "add", "-f", "--ignore-errors", "--pathspec-from-file=-",
+                    add_cmd = [platform_support.executable("git"), "-C", top, "add", "-f", "--ignore-errors", "--pathspec-from-file=-",
                                "--pathspec-file-nul"]
                     forced_input = "".join(x + "\0" for x in forced)
                     add = subprocess.run(add_cmd, env=dict(env, GIT_LITERAL_PATHSPECS="1"),
-                                         input=forced_input, capture_output=True, text=True)
+                                         input=forced_input, capture_output=True, text=True, encoding="utf-8")
                     if add.returncode != 0:
                         print("baton: 批量强制加入失败，逐个重试：" + add.stderr.strip()[:500], file=sys.stderr)
                         for path in forced:
                             one = subprocess.run(add_cmd, env=dict(env, GIT_LITERAL_PATHSPECS="1"),
-                                                 input=path + "\0", capture_output=True, text=True)
+                                                 input=path + "\0", capture_output=True, text=True, encoding="utf-8")
                             if one.returncode != 0:
                                 print(f"baton: 强制加入失败 {path}：{one.stderr.strip()[:300]}", file=sys.stderr)
-            tree = run(["git", "-C", top, "write-tree"], env=env).strip()
-            return run(["git", "-C", top, "commit-tree", tree, "-m", message], env=env).strip()
+            tree = run([platform_support.executable("git"), "-C", top, "write-tree"], env=env).strip()
+            return run([platform_support.executable("git"), "-C", top, "commit-tree", tree, "-m", message], env=env).strip()
 
 
 def store_ref(store, task, label, commit):
@@ -786,7 +794,7 @@ def _dossier_code_snapshot(store, ref, target):
     os.makedirs(target, exist_ok=True)
     if not store or not ref:
         return
-    proc = subprocess.Popen(["git", "-C", store.cwd, "archive", ref, ".", *code_excludes(store)],
+    proc = subprocess.Popen([platform_support.executable("git"), "-C", store.cwd, "archive", ref, ".", *code_excludes(store)],
                             env=store.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     data, err = proc.communicate()
     if proc.returncode != 0:
@@ -1356,7 +1364,7 @@ def _validate_monitor_check(value, max_chars=300):
 
 def _monitor_codex_command(project, dossier_id, cfg, output_path, effort=None, schema_path=None):
     model = (cfg.get("monitor") or {}).get("model")
-    command = ["codex", "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+    command = [platform_support.executable("codex"), "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                "--skip-git-repo-check", "-s", "read-only", "-C", dossier_path(project, dossier_id),
                "-m", model]
     if effort is not None:
@@ -1428,27 +1436,25 @@ def run_monitor_once(project, task, dossier_id, dossier_kind, cfg, prompt, leg_n
     stdout = stderr = ""
     try:
         if model in CONDUCTOR_MODELS:
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                                    start_new_session=True)
+            proc = platform_support.detached_popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, encoding="utf-8")
         else:
             event_stream = open(events_path, "w", encoding="utf-8")
             error_stream = open(stderr_path, "w", encoding="utf-8")
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
-                                    stdout=event_stream, stderr=error_stream, text=True, env=env,
-                                    start_new_session=True)
+            proc = platform_support.detached_popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+                                    stdout=event_stream, stderr=error_stream, text=True, env=env, encoding="utf-8")
         project.update_state(task, lambda s: _set_monitor_running(s, leg_n, dossier_id, proc.pid, attempt, started))
         stdout, stderr = proc.communicate(prompt, timeout=float((cfg.get("monitor") or {}).get("timeout_minutes", 40)) * 60)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            platform_support.terminate_group(proc)
         except (ProcessLookupError, PermissionError):
             pass
         try:
             proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                platform_support.terminate_group(proc, force=True)
             except (ProcessLookupError, PermissionError):
                 pass
             proc.communicate()
@@ -1519,27 +1525,25 @@ def run_monitor_check_once(project, task, dossier_id, cfg, prompt, leg_n=None):
     stdout = stderr = ""
     try:
         if model in CONDUCTOR_MODELS:
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                                    start_new_session=True)
+            proc = platform_support.detached_popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, encoding="utf-8")
         else:
             event_stream = open(events_path, "w", encoding="utf-8")
             error_stream = open(stderr_path, "w", encoding="utf-8")
-            proc = subprocess.Popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
-                                    stdout=event_stream, stderr=error_stream, text=True, env=env,
-                                    start_new_session=True)
+            proc = platform_support.detached_popen(command, cwd=dossier_path(project, dossier_id), stdin=subprocess.PIPE,
+                                    stdout=event_stream, stderr=error_stream, text=True, env=env, encoding="utf-8")
         project.update_state(task, lambda s: _set_check_running(s, leg_n, dossier_id, proc.pid, attempt, started))
         stdout, stderr = proc.communicate(prompt, timeout=float((cfg.get("monitor") or {}).get("timeout_minutes", 40)) * 60)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            platform_support.terminate_group(proc)
         except (ProcessLookupError, PermissionError):
             pass
         try:
             proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                platform_support.terminate_group(proc, force=True)
             except (ProcessLookupError, PermissionError):
                 pass
             proc.communicate()
@@ -1745,9 +1749,9 @@ def maybe_start_monitor_check(project, task, st, leg, force=False):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log = open(log_path, "w", encoding="utf-8")
     try:
-        runner = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
+        runner = platform_support.detached_popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
                                    "_monitor_check", task, dossier_id], stdin=subprocess.DEVNULL,
-                                  stdout=log, stderr=log, start_new_session=True, cwd=project.root)
+                                  stdout=log, stderr=log, cwd=project.root)
     finally:
         log.close()
     project.update_state(task, lambda state: (current_leg(state).setdefault("monitor_check", {}).update(
@@ -2665,7 +2669,7 @@ def verify_ledger(project):
     if not os.path.exists(path):
         return not read_text(os.path.join(directory, "head"), "").strip()
     lock_path = os.path.join(directory, "ledger.lock")
-    with open(lock_path, "a+") as lock:
+    with _locked(lock_path) as lock:
         if fcntl:
             fcntl.flock(lock, fcntl.LOCK_SH)
         head = read_text(os.path.join(directory, "head"), "").strip()
@@ -2688,7 +2692,7 @@ def append_ledger(project, record):
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, "verdicts.jsonl")
     lock_path = os.path.join(directory, "ledger.lock")
-    with open(lock_path, "a+") as lock:
+    with _locked(lock_path) as lock:
         if fcntl:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -2710,7 +2714,7 @@ def append_ledger(project, record):
             stream.write(record["record_hash"] + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(os.path.join(directory, "head.tmp"), os.path.join(directory, "head"))
+        platform_support.atomic_replace(os.path.join(directory, "head.tmp"), os.path.join(directory, "head"))
         if fcntl:
             fcntl.flock(lock, fcntl.LOCK_UN)
     return record
@@ -2757,9 +2761,9 @@ def shadow_excluded_many(store, paths, tracked=None):
     candidates = [path for path in paths if path not in tracked]
     if not candidates:
         return set()
-    p = subprocess.run(["git", "-C", store.top, "check-ignore", "--no-index", "-z", "--stdin"],
+    p = subprocess.run([platform_support.executable("git"), "-C", store.top, "check-ignore", "--no-index", "-z", "--stdin"],
                        env=store.env(), input="".join(path + "\0" for path in candidates),
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8")
     return {path for path in p.stdout.split("\0") if path} if p.returncode == 0 else set()
 
 
@@ -2775,8 +2779,8 @@ def git_repo_top(start):
     probe = os.path.abspath(start)
     while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
         probe = os.path.dirname(probe)
-    p = subprocess.run(["git", "-C", probe, "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True, env=clean_git_env())
+    p = subprocess.run([platform_support.executable("git"), "-C", probe, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True, env=clean_git_env(), encoding="utf-8")
     return canonical_dir(p.stdout.strip()) if p.returncode == 0 else None
 
 
@@ -3000,6 +3004,9 @@ class Project:
     @property
     def config(self):
         base = read_json(os.path.join(SKILL_DIR, "config.json"), {})
+        if os.name == "nt":
+            base = deep_merge(base, {"executor": {"backend": "codex"},
+                                     "memory": {"backend": "local"}})
         project_cfg, baton_cfg = self.config_layers()
         # quota belongs to the account-level skill configuration.  Keep the
         # project layers from changing it even though all other keys deep-merge.
@@ -3048,7 +3055,7 @@ class Project:
             cfg["executor"]["backend"] = "codex"
         cfg["project"] = {"root": self.root, "id": self.project_id, "state_dir": self.state_dir}
         baton_home = memory_baton_home(cfg)
-        memory_python = os.path.join(os.path.abspath(os.path.expanduser(baton_home)), "venv", "bin", "python")
+        memory_python = platform_support.venv_python(os.path.abspath(os.path.expanduser(baton_home)))
         if os.path.isfile(memory_python) and "baton-memory" not in cfg["executor"].get("toolsets", []):
             cfg["executor"]["toolsets"] = list(cfg["executor"].get("toolsets", [])) + ["baton-memory"]
         return validate_config(cfg)
@@ -3195,7 +3202,8 @@ class Project:
             die(f"任务 {task} 还有 Baton v1 的一轮在运行，它还在写旧的状态文件；"
                 "等这一轮结束再用新版本操作这个任务")
         os.makedirs(self.state_task_dir(task), exist_ok=True)
-        with open(self.state_lock_path(task), "w") as lock:
+        with (platform_support.exclusive_lock(self.state_lock_path(task)) if os.name == "nt"
+              else open(self.state_lock_path(task), "w", encoding="utf-8")) as lock:
             if fcntl:
                 fcntl.flock(lock, fcntl.LOCK_EX)
             st = read_json(self.state_path(task), {})
@@ -3240,6 +3248,9 @@ def kill_codex(leg):
     if not codex_alive(leg):
         return False
     pid = leg["codex_pid"]
+    if os.name == "nt":
+        platform_support.stop_tree(pid, (8, 3))
+        return True
     for sig, grace in ((signal.SIGTERM, 8), (signal.SIGKILL, 3)):
         try:
             os.killpg(pid, sig)
@@ -3767,7 +3778,7 @@ def hermes_terminal_calls(project, task, leg, since=None):
     try:
         result = subprocess.run([python, "-c", _HERMES_DB_READER, db_path, str(session_id),
                                  "" if since is None else str(since)],
-                                env=_hermes_subprocess_env(cfg), capture_output=True, text=True, timeout=10)
+                                env=_hermes_subprocess_env(cfg), capture_output=True, text=True, timeout=10, encoding="utf-8")
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"WARN：Hermes state.db 读取失败：{exc}")
         return []
@@ -3804,8 +3815,8 @@ def external_action_findings(before_refs, after_refs, calls):
 
 
 def git_remote_refs(root):
-    result = subprocess.run(["git", "-C", root, "for-each-ref", "--format=%(refname) %(objectname)",
-                             "refs/remotes"], env=clean_git_env(), capture_output=True, text=True)
+    result = subprocess.run([platform_support.executable("git"), "-C", root, "for-each-ref", "--format=%(refname) %(objectname)",
+                             "refs/remotes"], env=clean_git_env(), capture_output=True, text=True, encoding="utf-8")
     return result.stdout.splitlines() if result.returncode == 0 else []
 
 
@@ -4794,7 +4805,7 @@ def run_verification(project, task, st, cfg, leg_n=None, baseline=False, skip_re
     run_command = command
     if is_pytest:
         junit = project.leg_path(task, leg_n, "junit.xml") if leg_n else os.path.join(freeze_dir(project, task), "baseline.junit.xml")
-        run_command += " --junitxml=" + shlex.quote(junit) + " -rA -o junit_family=xunit1"
+        run_command += " --junitxml=" + (subprocess.list2cmdline([junit]) if os.name == "nt" else shlex.quote(junit)) + " -rA -o junit_family=xunit1"
         result["junitxml"] = junit
         os.makedirs(os.path.dirname(junit), exist_ok=True)
         try:
@@ -4807,9 +4818,9 @@ def run_verification(project, task, st, cfg, leg_n=None, baseline=False, skip_re
     started = now()
     try:
         timeout = float((cfg.get("supervision") or {}).get("verify_timeout_minutes", 30)) * 60
-        proc = subprocess.Popen(run_command, cwd=project.root, shell=True,
+        proc = platform_support.detached_popen(run_command, cwd=project.root, shell=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+                                text=True, encoding="utf-8")
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as e:
@@ -4818,7 +4829,7 @@ def run_verification(project, task, st, cfg, leg_n=None, baseline=False, skip_re
             output = ((e.stdout or "") if isinstance(e.stdout, str) else "") \
                 + ((e.stderr or "") if isinstance(e.stderr, str) else "")
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                platform_support.terminate_group(proc)
             except (ProcessLookupError, PermissionError):
                 pass
             try:
@@ -4828,7 +4839,7 @@ def run_verification(project, task, st, cfg, leg_n=None, baseline=False, skip_re
                 output += ((e2.stdout or "") if isinstance(e2.stdout, str) else "") \
                     + ((e2.stderr or "") if isinstance(e2.stderr, str) else "")
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    platform_support.terminate_group(proc, force=True)
                 except (ProcessLookupError, PermissionError):
                     pass
                 more_stdout, more_stderr = proc.communicate()
@@ -5010,7 +5021,7 @@ def _config_assignment(value):
 
 
 def _open_tty():
-    return open("/dev/tty", "r+")
+    return open("/dev/tty", "r+", encoding="utf-8")
 
 
 def _require_task_confirmation(task):
@@ -5158,7 +5169,7 @@ def protocol_text(project, task):
 
 def codex_command(project, kind, thread_id, last_path, cfg=None):
     ex = (cfg or project.config)["executor"]
-    cmd = ["codex", "exec"] + (["resume"] if kind == "resume" else [])
+    cmd = [platform_support.executable("codex"), "exec"] + (["resume"] if kind == "resume" else [])
     cmd += ["--json", "-m", ex["model"],
             "-c", f'model_reasoning_effort="{ex["reasoning_effort"]}"',
             "-c", f'service_tier="{ex["service_tier"]}"',
@@ -5285,7 +5296,7 @@ def _memory_keyword_fallback(project, task, prompt, st, cfg, reason):
 def memory_prompt_for_leg(project, task, prompt, st=None, cfg=None):
     """Compute the complete memory injection in the installed venv subprocess."""
     cfg = cfg or project.config
-    python = memory_venv_python(cfg)
+    python = None if (cfg.get("memory") or {}).get("backend") == "local" else memory_venv_python(cfg)
     if not python:
         return _memory_keyword_fallback(project, task, prompt, st or {}, cfg, "本轮没有记忆工具（venv 不存在）")
     brief = read_text(os.path.join(project.task_dir(task), "brief.md"))
@@ -5303,7 +5314,7 @@ def memory_prompt_for_leg(project, task, prompt, st=None, cfg=None):
     try:
         result = subprocess.run([python, "-m", "baton_memory.prompt"], cwd=project.root, env=env,
                                 input=json.dumps(payload, ensure_ascii=False), capture_output=True,
-                                text=True, timeout=25)
+                                text=True, timeout=25, encoding="utf-8")
         value = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
         if not result.returncode or value.get("ok"):
             if value.get("ok"):
@@ -5350,7 +5361,17 @@ def hermes_ephemeral_system_prompt(project, task, st):
     return "\n".join(lines)
 
 
+WINDOWS_HERMES_ERROR = ("Hermes executor is unsupported on Windows: Hermes + sandbox-exec are macOS-oriented. "
+                        "Set executor.backend to codex.")
+
+
+def require_supported_executor(cfg):
+    if os.name == "nt" and cfg["executor"].get("backend") == "hermes":
+        raise ConfigError(WINDOWS_HERMES_ERROR)
+
+
 def hermes_preflight(project, cfg):
+    require_supported_executor(cfg)
     """Reject unsafe Hermes profile state before starting a leg."""
     ex = cfg["executor"]
     profile = hermes_profile_dir(cfg)
@@ -5365,7 +5386,7 @@ def hermes_preflight(project, cfg):
         raise ConfigError("Hermes 与 Codex CLI 的账号 id 不一致，拒绝启动；请登录同一个账号")
     if ex.get("network_access"):
         command = [hermes_executable(cfg), "-p", ex.get("hermes_profile", "baton-exec-v2"), "tools", "list"]
-        result = subprocess.run(command, env=_hermes_subprocess_env(cfg), capture_output=True, text=True)
+        result = subprocess.run(command, env=_hermes_subprocess_env(cfg), capture_output=True, text=True, encoding="utf-8")
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         if result.returncode != 0:
             print("WARN：无法确认 Hermes web_search 工具列表；按本机 CLI 版本跳过检查。")
@@ -5384,7 +5405,10 @@ def _mcp_jsonrpc_request(proc, method, params, ident, timeout=4.0):
     deadline = now() + timeout
     while now() < deadline:
         remaining = max(0.05, deadline - now())
-        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if os.name == "nt":
+            ready = platform_support.pipe_ready(proc.stdout.fileno(), remaining)
+        else:
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
         if not ready:
             continue
         line = proc.stdout.readline()
@@ -5410,7 +5434,7 @@ def memory_mcp_preflight(project, task, leg_n, cfg, timeout=5.0):
                 "BATON_LEG_STARTED": str(now()), "BATON_MCP_PREFLIGHT": "1"})
     proc = subprocess.Popen([python, "-m", "baton_memory.server"], cwd=project.root,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env)
+                            text=True, env=env, encoding="utf-8")
     try:
         if proc.stdin is None or proc.stdout is None:
             raise ConfigError("baton-memory preflight 没有 stdio")
@@ -5516,6 +5540,11 @@ def statusline_entry(project, previous):
         if isinstance(sl, dict) and not baton_statusline.is_baton_command(sl.get("command")):
             interval = sl.get("refreshInterval")
     command = f"python3 {shlex.quote(statusline_script_path())} {baton_statusline.MARK}"
+    if os.name == "nt":
+        # Claude Code uses Git Bash on Windows; slash paths survive shell parsing.
+        command = (f"{shlex.quote(sys.executable.replace(chr(92), '/'))} "
+                   f"{shlex.quote(statusline_script_path().replace(chr(92), '/'))} "
+                   f"{baton_statusline.MARK}")
     return {"type": "command", "command": command, "refreshInterval": interval or 60}
 
 
@@ -5545,13 +5574,13 @@ def settings_tracked(project):
     if not is_git(project.root):
         return False
     top = git_top(project.root)
-    return subprocess.run(["git", "-C", top, "ls-files", "--error-unmatch", "--",
+    return subprocess.run([platform_support.executable("git"), "-C", top, "ls-files", "--error-unmatch", "--",
                            ":(icase)" + settings_rel_top(project)], capture_output=True).returncode == 0
 
 
 def settings_ignored(project):
     top = git_top(project.root)
-    return subprocess.run(["git", "-C", top, "check-ignore", "-q", "--", settings_rel_top(project)]).returncode == 0
+    return subprocess.run([platform_support.executable("git"), "-C", top, "check-ignore", "-q", "--", settings_rel_top(project)]).returncode == 0
 
 
 def ensure_settings_ignored(project):
@@ -5571,7 +5600,7 @@ def ensure_settings_ignored(project):
     path = path if os.path.isabs(path) else os.path.join(top, path)
     if pattern not in read_text(path).splitlines():
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"\n# Baton: machine-local Claude Code settings\n{pattern}\n")
     if not settings_ignored(project):
         return "注意：.claude/settings.local.json 没能被 git 忽略（项目规则又把它放行了），提交前请检查"
@@ -5675,12 +5704,12 @@ def write_baton_gitignore(project):
     have = read_text(gi).splitlines() if os.path.exists(gi) else None
     if have is None:
         os.makedirs(project.dir, exist_ok=True)
-        with open(gi, "w") as f:
+        with open(gi, "w", encoding="utf-8") as f:
             f.write("# Baton runtime and machine-local files\n" + "\n".join(BATON_GITIGNORE) + "\n")
         return
     missing = [line for line in BATON_GITIGNORE if line not in have]
     if missing:
-        with open(gi, "a") as f:
+        with open(gi, "a", encoding="utf-8") as f:
             f.write("\n" + "\n".join(missing) + "\n")
 
 
@@ -5750,7 +5779,7 @@ def memory_baton_home(cfg=None):
 
 
 def memory_venv_python(cfg=None):
-    path = os.path.join(memory_baton_home(cfg), "venv", "bin", "python")
+    path = platform_support.venv_python(memory_baton_home(cfg))
     return path if os.path.isfile(path) else None
 
 
@@ -5783,7 +5812,7 @@ def hermes_default_soul(cfg):
         agent = os.environ.get("HERMES_AGENT_DIR") or (cfg.get("executor") or {}).get("hermes_agent_dir")
         if agent:
             env["PYTHONPATH"] = os.path.expanduser(agent) + os.pathsep + env.get("PYTHONPATH", "")
-        result = subprocess.run([python, "-c", script], env=env, capture_output=True, text=True)
+        result = subprocess.run([python, "-c", script], env=env, capture_output=True, text=True, encoding="utf-8")
         if result.returncode == 0 and (result.stdout or "").strip():
             return result.stdout
     return HERMES_DEFAULT_SOUL_MARKER
@@ -5844,7 +5873,7 @@ def _hermes_profile_create(cfg):
     if os.path.isdir(profile_dir):
         return False
     command = [hermes_executable(cfg), "profile", "create", profile, "--no-skills", "--no-alias"]
-    result = subprocess.run(command, env=_hermes_subprocess_env(cfg), capture_output=True, text=True)
+    result = subprocess.run(command, env=_hermes_subprocess_env(cfg), capture_output=True, text=True, encoding="utf-8")
     if result.returncode != 0:
         raise ConfigError("Hermes profile 创建失败：" + (result.stderr or result.stdout or "退出码 %s" % result.returncode).strip()[-1000:])
     os.makedirs(profile_dir, exist_ok=True)
@@ -5889,7 +5918,7 @@ def _scan_soul_with_hermes(cfg, text):
     agent = os.environ.get("HERMES_AGENT_DIR") or (cfg.get("executor") or {}).get("hermes_agent_dir")
     if agent:
         env["PYTHONPATH"] = os.path.expanduser(agent) + os.pathsep + env.get("PYTHONPATH", "")
-    result = subprocess.run([python, "-c", script], input=text, capture_output=True, text=True, env=env)
+    result = subprocess.run([python, "-c", script], input=text, capture_output=True, text=True, env=env, encoding="utf-8")
     if result.returncode != 0:
         raise ConfigError("Hermes 注入扫描失败：" + (result.stderr or result.stdout or "退出码 %s" % result.returncode).strip()[-1000:])
     findings = None
@@ -6249,10 +6278,11 @@ def migrate_baton_config(project):
     executor = migrated.setdefault("executor", {})
     if not isinstance(executor, dict):
         die("无法迁移：executor 必须是 JSON object")
-    executor["backend"] = "hermes"
+    executor["backend"] = "codex" if os.name == "nt" else "hermes"
     executor["model"] = "gpt-5.6-luna"
-    for key in ("service_tier", "disable_fast_mode", "sandbox"):
-        executor.pop(key, None)
+    if os.name != "nt":
+        for key in ("service_tier", "disable_fast_mode", "sandbox"):
+            executor.pop(key, None)
     new_text = json.dumps(migrated, ensure_ascii=False, indent=2) + "\n"
     if new_text == original_text:
         print(f"配置已经是 v2，无需迁移：{path}")
@@ -6303,7 +6333,7 @@ def cmd_init(project, args):
     # Validate an existing baton.json before changing the project state.  When
     # it is absent, the skill defaults and any existing .baton override form
     # the values used for the generated file below.
-    project.config
+    require_supported_executor(project.config)
     for d in ("tasks", "reports", "reviews", "decisions", "runs"):
         os.makedirs(project.p(d), exist_ok=True)
     project = Project(project.root)  # the newly created directory now has its on-disk spelling
@@ -6354,10 +6384,10 @@ def cmd_init(project, args):
     if cfg["executor"].get("backend") == "hermes":
         prepare_hermes_profile(project, cfg, upgrade_profile=bool(getattr(args, "upgrade_profile", False)))
     if not os.path.exists(project.p("log.md")):
-        with open(project.p("log.md"), "w") as f:
+        with open(project.p("log.md"), "w", encoding="utf-8") as f:
             f.write("# Baton 修改日志\n\n执行者每完成一处修改追加一条；major 条目指向 reports/ 下的汇报。\n")
     if not os.path.exists(project.p("supervision.md")):
-        with open(project.p("supervision.md"), "w") as f:
+        with open(project.p("supervision.md"), "w", encoding="utf-8") as f:
             f.write("# Baton 监管记录\n\nOpus 每 30 分钟一次的检查结论。\n")
     ensure_shadow(project)
     project.record_id()
@@ -6377,7 +6407,7 @@ def _human_kb(kb):
 
 def _du(path):
     try:
-        p = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=30, encoding="utf-8")
         if p.returncode == 0 and p.stdout.split():
             return _human_kb(int(p.stdout.split()[0]))
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -6450,7 +6480,7 @@ def print_snapshot_scope(project, max_depth=4):
         depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
         keep = []
         for d in sorted(dirnames):
-            rel = d if rel_dir == "." else os.path.join(rel_dir, d)
+            rel = d if rel_dir == "." else os.path.join(rel_dir, d).replace(os.sep, "/")
             if d in skip or d.startswith(".venv") or os.path.islink(os.path.join(dirpath, d)):
                 continue
             if is_project_dir(os.path.join(dirpath, d)):
@@ -6494,7 +6524,7 @@ def cmd_new(project, args):
         shutil.copyfile(args.brief, brief)
     else:
         text = read_text(os.path.join(TEMPLATES, "brief.md")).replace("{{TASK}}", args.task)
-        with open(brief, "w") as f:
+        with open(brief, "w", encoding="utf-8") as f:
             f.write(text)
     print(brief)
 
@@ -6518,7 +6548,8 @@ def running_task(project, exclude=None):
 def launch_leg(project, task, kind, prompt, force_escalate=False):
     os.makedirs(project.dir, exist_ok=True)
     os.makedirs(project.state_dir, exist_ok=True)
-    with open(project.launch_lock_path(), "w") as launch_lock:
+    with (platform_support.exclusive_lock(project.launch_lock_path()) if os.name == "nt"
+          else open(project.launch_lock_path(), "w", encoding="utf-8")) as launch_lock:
         if fcntl:
             fcntl.flock(launch_lock, fcntl.LOCK_EX)  # one launch at a time per project
         st = project.read_state(task, {}) or {}
@@ -6526,6 +6557,7 @@ def launch_leg(project, task, kind, prompt, force_escalate=False):
             die(f"任务 {task} 已 closed，不能 start 或 resume")
         st = refresh_runner_liveness(project, task, st) if st.get("legs") else st
         cfg = config_for_state(project, st)
+        require_supported_executor(cfg)
         escalation = escalation_decision(project, task, st, force=force_escalate)
         effective_cfg = _effective_executor_config(cfg, escalation)
         if cfg["executor"].get("backend") == "hermes":
@@ -6575,7 +6607,7 @@ def launch_leg(project, task, kind, prompt, force_escalate=False):
                           "\n\n" + memory_meta["context"])
             elif cfg["executor"].get("backend") == "hermes":
                 prompt = original_prompt.rstrip() + "\n\n" + memory_meta["context"]
-        with open(prompt_path, "w") as f:
+        with open(prompt_path, "w", encoding="utf-8") as f:
             f.write(prompt)
 
         print(codex_quota.describe(safe_quota(block=True, notify=True)))
@@ -6638,12 +6670,11 @@ def launch_leg(project, task, kind, prompt, force_escalate=False):
                                         last_leg=n)
         project.update_state(task, add_leg)
 
-        log = open(project.leg_path(task, n, "runner.log"), "w")
+        log = open(project.leg_path(task, n, "runner.log"), "w", encoding="utf-8")
         try:
-            runner = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
+            runner = platform_support.detached_popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
                                        "_run", task, str(n)],
-                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                      start_new_session=True, cwd=project.root)
+                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=project.root)
         finally:
             log.close()
         if hasattr(runner, "poll"):
@@ -6674,6 +6705,7 @@ def launch_leg(project, task, kind, prompt, force_escalate=False):
 
 
 def cmd_start(project, args):
+    require_supported_executor(project.config)
     project.require_init()
     check_task(args.task)
     brief_path = os.path.join(project.task_dir(args.task), "brief.md")
@@ -6691,7 +6723,7 @@ def cmd_start(project, args):
         die("supervision.test_command 为空；范围块 verify=auto 时必须配置验证命令，或写 verify=none")
     if st.get("thread_id"):
         die(f"任务 {args.task} 已有 Codex 会话 {st['thread_id']}；继续请用 baton resume")
-    r = subprocess.run(["git", "check-ref-format", f"refs/baton/{args.task}/base"])
+    r = subprocess.run([platform_support.executable("git"), "check-ref-format", f"refs/baton/{args.task}/base"])
     if r.returncode != 0:
         die(f"任务名 {args.task} 不能用作 git ref，请换一个")
     write_baton_gitignore(project)
@@ -6863,6 +6895,9 @@ def cmd_resume(project, args, message=None):
 
 
 def _interrupt(proc):
+    if os.name == "nt":
+        platform_support.stop_tree(proc.pid, (20, 10, 5))
+        return
     for sig, grace in ((signal.SIGINT, 20), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
         try:
             os.killpg(proc.pid, sig)
@@ -6882,7 +6917,10 @@ class _Terminated(Exception):
 def _raise_terminated(signum, frame):
     # one shutdown is enough: ignore further TERM/HUP while we stop codex and record the leg
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
     raise _Terminated(f"signal {signum}")
 
 
@@ -6890,7 +6928,10 @@ def cmd_run(project, args):
     """Internal: the detached leg runner. Always records a result, even when it is killed."""
     task, n = args.task, int(args.n)
     signal.signal(signal.SIGTERM, _raise_terminated)
-    signal.signal(signal.SIGHUP, _raise_terminated)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _raise_terminated)
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, _raise_terminated)
     st = project.load_state(task)
     leg = st["legs"][n - 1]
     stop_flag = project.leg_path(task, n, "stop")
@@ -6904,6 +6945,7 @@ def cmd_run(project, args):
     memory_tool_reason = None
     try:
         cfg = config_for_state(project, st)
+        require_supported_executor(cfg)
         # Keep retries on the model selected when this leg was launched.  The
         # task snapshot itself remains on the default model for later legs.
         if leg.get("model"):
@@ -7015,13 +7057,13 @@ def cmd_run(project, args):
             remote_refs_before = git_remote_refs(project.root)
             with open(leg["events"], "ab") as fout, open(leg["stderr"], "ab") as ferr:
                 if is_hermes:
-                    proc = subprocess.Popen(attempt_cmd, cwd=project.root, stdin=subprocess.DEVNULL,
-                                            stdout=fout, stderr=ferr, start_new_session=True,
+                    proc = platform_support.detached_popen(attempt_cmd, cwd=project.root, stdin=subprocess.DEVNULL,
+                                            stdout=fout, stderr=ferr,
                                             env=hermes_executor_env(project, task, n, leg["started_at"], cfg, st))
                 else:
                     with open(attempt_prompt, "rb") as fin:
-                        proc = subprocess.Popen(attempt_cmd, cwd=project.root, stdin=fin, stdout=fout,
-                                                stderr=ferr, start_new_session=True)
+                        proc = platform_support.detached_popen(attempt_cmd, cwd=project.root, stdin=fin, stdout=fout,
+                                                stderr=ferr)
             set_codex_pid(proc.pid, exited=False)
             while proc.poll() is None:
                 time.sleep(0.2)
@@ -7194,12 +7236,18 @@ def cmd_run(project, args):
             project.update_state(task, record_retry)
     except BaseException as e:  # noqa: BLE001 — killed or crashed: stop codex, still record the leg
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if os.name == "nt":
+            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
         error = f"runner 中断（{type(e).__name__}: {e}）"
         if proc is not None and proc.poll() is None:
             _interrupt(proc)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
     if proc is not None:
         rc = proc.wait()
     result = normalize_executor_result(read_json(leg["last"]))
@@ -7591,9 +7639,9 @@ def cmd_monitor(project, args):
     log = open(log_path, "w", encoding="utf-8")
     try:
         marker = f"_monitor_run {args.task} {args.dossier}"
-        runner = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
+        runner = platform_support.detached_popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
                                    "_monitor", "--marker", marker, args.task, args.dossier], stdin=subprocess.DEVNULL,
-                                  stdout=log, stderr=log, start_new_session=True, cwd=project.root)
+                                  stdout=log, stderr=log, cwd=project.root)
     finally:
         log.close()
     project.update_state(args.task, lambda s: (current_leg(s).get("monitor") or {}).update(pid=runner.pid,
@@ -7609,9 +7657,9 @@ def _start_monitor_process(project, task, dossier_id, rerun=False, curation=Fals
     log = open(log_path, "w", encoding="utf-8")
     marker = f"_monitor_run {task} {dossier_id}"
     try:
-        runner = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
+        runner = platform_support.detached_popen([sys.executable, os.path.abspath(__file__), "--root", project.root,
                                    "_monitor", "--marker", marker, task, dossier_id], stdin=subprocess.DEVNULL,
-                                  stdout=log, stderr=log, start_new_session=True, cwd=project.root)
+                                  stdout=log, stderr=log, cwd=project.root)
     finally:
         log.close()
     def update(state):
@@ -8024,7 +8072,7 @@ def cmd_supervised(project, args):
     events_off = pend["events_offset"] if pend else (read_events(leg["events"])[1] if leg else 0)
     log_off = pend["log_offset"] if pend else file_size(project.p("log.md"))
     since = pend["at"] if pend else now()
-    with open(project.p("supervision.md"), "a") as f:
+    with open(project.p("supervision.md"), "a", encoding="utf-8") as f:
         f.write(f"\n## {stamp()} · {task} · 第 {leg['n'] if leg else '-'} 轮 · {args.verdict}\n\n"
                 f"{args.note.strip()}\n\n- 回滚点：`{ref or '无'}`\n")
 
@@ -8045,7 +8093,7 @@ def cmd_stop(project, args):
     st = refresh_runner_liveness(project, args.task, project.load_state(args.task))
     leg = current_leg(st)
     if leg and (leg.get("monitor") or {}).get("status") == "running" and leg.get("status") != "running":
-        with open(project.leg_path(args.task, leg["n"], "stop"), "w") as stream:
+        with open(project.leg_path(args.task, leg["n"], "stop"), "w", encoding="utf-8") as stream:
             stream.write(args.reason or "stopped by conductor")
         print(f"已请求停止 monitor（卷宗 {(leg.get('monitor') or {}).get('id')}）")
         return
@@ -8061,7 +8109,7 @@ def cmd_stop(project, args):
         else:
             print("没有运行中的一轮")
         return
-    with open(project.leg_path(args.task, leg["n"], "stop"), "w") as f:
+    with open(project.leg_path(args.task, leg["n"], "stop"), "w", encoding="utf-8") as f:
         f.write(args.reason or "stopped by conductor")
     deadline = now() + 60
     while now() < deadline:
@@ -8237,7 +8285,7 @@ def _suspend_memory_after_rollback(project, task, store, target_ref, rollback_re
             continue
         # git returns no stdout for this plumbing command; use the process
         # directly so a missing ref and a false ancestor are distinguishable.
-        proc = subprocess.run(["git", "-C", store.top, "merge-base", "--is-ancestor", target_ref, source_commit],
+        proc = subprocess.run([platform_support.executable("git"), "-C", store.top, "merge-base", "--is-ancestor", target_ref, source_commit],
                               env=store.env(), capture_output=True)
         if proc.returncode == 0:
             ledger.append_status(ident, "suspended", status_reason="来源快照晚于回滚目标",
@@ -8442,7 +8490,8 @@ def cmd_config(project, args):
     if cfg.get("mode") == "lean":
         print(LEAN_HINT)
     if project.needs_backend_migration:
-        print("迁移提示：旧项目继续使用 codex；v2 默认执行者将改为 Hermes，第 4 阶段提供 baton init --migrate。",
+        print("迁移提示：旧项目继续使用 codex；Windows v2 也使用 codex，可用 baton init --migrate 迁移配置。"
+              if os.name == "nt" else "迁移提示：旧项目继续使用 codex；v2 默认执行者将改为 Hermes，第 4 阶段提供 baton init --migrate。",
               file=sys.stderr if args.json else sys.stdout)
     if args.json:
         print(json.dumps(cfg, ensure_ascii=False, indent=2))
@@ -8494,7 +8543,7 @@ def doctor_hermes(project, cfg, line):
     check("OK" if hermes_available else "FAIL", f"hermes CLI：{hermes_available or '未安装'}")
     if hermes_available:
         version = subprocess.run([hermes, "--version"], env=_hermes_subprocess_env(cfg),
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, encoding="utf-8")
         version_text = version.stdout or version.stderr or ""
         version_line = next((item.strip() for item in version_text.splitlines() if item.strip()), "未知")
         check("OK" if version.returncode == 0 else "WARN",
@@ -8533,6 +8582,9 @@ def doctor_hermes(project, cfg, line):
 
 def doctor_memory(project, cfg, line):
     """Check the real memory venv, Ollama model/dimensions, MCP and ledger."""
+    if (cfg.get("memory") or {}).get("backend") == "local":
+        line("WARN", "memory.backend=local: keyword/ledger memory; Ollama/mem0 optional and not required")
+        return False
     python = memory_venv_python(cfg)
     if not python:
         line("WARN", "记忆工具未安装（venv 不存在），本轮执行者照常运行")
@@ -8551,7 +8603,7 @@ def doctor_memory(project, cfg, line):
               "ensure_model(); v=embed_text('Baton doctor'); print('DIMS='+str(len(v))); "
               "assert len(v)==MODEL_DIMS")
     probe = subprocess.run([python, "-c", script], cwd=project.root, env=env,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30, encoding="utf-8")
     if probe.returncode != 0:
         check("FAIL", "Ollama/嵌入检查失败：" + (probe.stderr or probe.stdout).strip()[-500:])
     else:
@@ -8565,7 +8617,7 @@ def doctor_memory(project, cfg, line):
                          "v=c.config.params.vectors; size=getattr(v, 'size', None) if not isinstance(v, dict) else next(iter(v.values())).size; "
                          "print('COLLECTION_DIMS='+str(size)); assert size==MODEL_DIMS" % project.root)
     collection = subprocess.run([python, "-c", collection_script], cwd=project.root, env=env,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30, encoding="utf-8")
     if collection.returncode == 0:
         value = next((line_text.split("=", 1)[1] for line_text in collection.stdout.splitlines()
                       if line_text.startswith("COLLECTION_DIMS=")), "?")
@@ -8575,7 +8627,7 @@ def doctor_memory(project, cfg, line):
     else:
         check("FAIL", "collection 维度检查失败：" + (collection.stderr or collection.stdout).strip()[-500:])
     imports = subprocess.run([python, "-c", "import mem0, mcp, ollama"], env=env,
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=30, encoding="utf-8")
     check("OK" if imports.returncode == 0 else "FAIL",
           "venv import mem0/mcp/ollama" if imports.returncode == 0 else "venv import 失败：" + imports.stderr.strip()[-500:])
     good, error = __import__("baton_memory.ledger", fromlist=["MemoryLedger"]).MemoryLedger(project).verify(repair=True)
@@ -8678,13 +8730,16 @@ def cmd_doctor(project, args):
     ex = cfg["executor"]
     for path in legacy_claude_instruction_warnings(project):
         line("WARN", f"旧版 Baton 指令出现在 {path}：请改用 conductor.model、monitor 监督简报和 baton rule，不能派子 agent 代替 monitor")
-    codex = shutil.which("codex")
+    codex = shutil.which("codex.exe" if os.name == "nt" else "codex")
     codex_level = "WARN" if ex.get("backend") == "hermes" and not codex else ("OK" if codex else "FAIL")
     line(codex_level, f"codex CLI：{codex or '未安装'}")
     if codex:
-        line("OK", run(["codex", "--version"], check=False).strip())
+        line("OK", run([platform_support.executable("codex"), "--version"], check=False).strip())
     if ex.get("backend") == "hermes":
-        ok = not doctor_hermes(project, cfg, line) and ok
+        if os.name == "nt":
+            line("FAIL", WINDOWS_HERMES_ERROR)
+        else:
+            ok = not doctor_hermes(project, cfg, line) and ok
     ok = not doctor_memory(project, cfg, line) and ok
     baton_state = "存在" if os.path.exists(project.baton_config_path) else "缺失"
     line("OK" if baton_state == "存在" else "WARN",
@@ -8708,11 +8763,11 @@ def cmd_doctor(project, args):
         line("WARN", desc.splitlines()[-1])
     else:
         line("OK" if data and data.get("source") == "live" else "WARN", desc.splitlines()[-1])
-    launcher = os.path.realpath(os.path.join(SKILL_DIR, "bin", "baton"))
+    launcher = os.path.realpath(os.path.join(SKILL_DIR, "bin", "baton.cmd" if os.name == "nt" else "baton"))
     on_path = shutil.which("baton")
     if not on_path:
         line("WARN", f"PATH 上没有 baton；可以直接用 {launcher}")
-    elif os.path.realpath(on_path) != launcher:
+    elif os.path.normcase(os.path.realpath(on_path)) != os.path.normcase(launcher):
         line("WARN", f"PATH 上的 baton（{on_path}）不是这个 skill 的，请改用 {launcher} 或处理同名冲突")
     else:
         line("OK", f"baton 命令：{on_path}")
@@ -8795,13 +8850,13 @@ def run_monitor_probe(project, cfg, line):
         codex_prompt = ("如果你收到的指令中出现下面给出的第一行，请原样输出其后前三个候选行中的任意一行；"
                         "HTML 注释和只有标点的行不算候选。如果看不到这第一行，或没有候选行，就只输出 NONE。\n"
                         f"第一行：{first}")
-        command = ["codex", "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+        command = [platform_support.executable("codex"), "exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral",
                    "--skip-git-repo-check", "-s", "read-only", "-C", dossier,
                    "-m", monitor_model, "-o", output, "-"]
         try:
           if not result.get("codex_skipped"):
             p = subprocess.run(command, cwd=dossier, input=codex_prompt, text=True,
-                               capture_output=True, timeout=60, env=os.environ.copy())
+                               capture_output=True, timeout=60, env=os.environ.copy(), encoding="utf-8")
             with open(events_path, "w", encoding="utf-8") as stream:
                 stream.write(p.stdout or "")
             shutil.copyfile(output, last_path) if os.path.isfile(output) else Path(last_path).write_text("", encoding="utf-8")
@@ -8857,7 +8912,7 @@ def run_monitor_probe(project, cfg, line):
             p = subprocess.run(command, cwd=dossier, input=claude_prompt, text=True,
                                capture_output=True, timeout=60, env=dict(os.environ,
                                CLAUDE_CODE_DISABLE_CLAUDE_MDS="1", CLAUDE_CODE_DISABLE_AUTO_MEMORY="1",
-                               ENABLE_CLAUDEAI_MCP_SERVERS="false"))
+                               ENABLE_CLAUDEAI_MCP_SERVERS="false"), encoding="utf-8")
             Path(claude_stream_path).write_text(p.stdout or "", encoding="utf-8")
             if secret in (p.stdout or ""):
                 line("FAIL", "Claude monitor 探针：上级 CLAUDE.md 口令泄露")

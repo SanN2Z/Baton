@@ -22,7 +22,7 @@ class GoliveTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="baton-golive-")
         self.base = Path(self.tmp.name)
         self.env = patch.dict(os.environ, {
-            "HOME": str(self.base / "home"),
+            "HOME": str(self.base / "home"), "USERPROFILE": str(self.base / "home"),
             "BATON_HOME": str(self.base / "state"),
             "BATON_DESKTOP_NOTIFY": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -51,7 +51,7 @@ class GoliveTests(unittest.TestCase):
         written = json.loads((root / "baton.json").read_text(encoding="utf-8"))
         self.assertEqual(written["conductor"]["model"], "opus")
         self.assertEqual(written["monitor"]["model"], "gpt-5.6-sol")
-        self.assertEqual(written["executor"]["backend"], "hermes")
+        self.assertEqual(written["executor"]["backend"], "codex" if os.name == "nt" else "hermes")
         self.assertEqual(written["executor"]["model"], "gpt-5.6-luna")
 
     def test_review_reference_example_uses_adopt_reject_and_parses(self):
@@ -83,10 +83,11 @@ class GoliveTests(unittest.TestCase):
         self.assertIn("不能派子 agent 代替 monitor", out.getvalue())
 
 
+@unittest.skipIf(os.name == "nt", "POSIX installer only; Windows installer is statically validated, never run")
 class InstallScriptTests(unittest.TestCase):
     def run_install(self, home, path=None):
         env = os.environ.copy()
-        env.update({"HOME": str(home), "CLAUDE_SKILLS_DIR": str(home / ".claude/skills"),
+        env.update({"HOME": str(home), "USERPROFILE": str(home), "CLAUDE_SKILLS_DIR": str(home / ".claude/skills"),
                     "BATON_BIN_DIR": str(home / ".local/bin"),
                     "PATH": path or env.get("PATH", "")})
         return subprocess.run(["bash", str(ROOT / "install.sh")], cwd=str(ROOT), env=env,
