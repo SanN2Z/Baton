@@ -5192,14 +5192,14 @@ def _config_assignment(value):
 
 
 def _open_tty():
-    return open("/dev/tty", "r+", encoding="utf-8")
+    return platform_support.open_tty()
 
 
 def _require_task_confirmation(task):
     try:
         tty = _open_tty()
     except OSError as e:
-        raise ConfigError(f"需要在真实终端逐字确认任务名；无法打开 /dev/tty：{e}") from e
+        raise ConfigError(f"需要在真实终端逐字确认任务名；无法打开 {platform_support.tty_name()}：{e}") from e
     try:
         tty.write(f"确认放宽任务 {task}？请逐字输入任务名：")
         tty.flush()
@@ -5279,7 +5279,7 @@ def cmd_amend(project, args):
     if not (assignments or amendment_text or adopt):
         die("amend 至少需要修正案文件、--config 或 --adopt")
     if relax and not args.user_approved:
-        die("这是放宽冻结或验证标准的操作，请加 --user-approved 并在 /dev/tty 逐字确认任务名")
+        die("这是放宽冻结或验证标准的操作，请加 --user-approved 并在真实终端逐字确认任务名")
     if args.user_approved:
         _require_task_confirmation(args.task)
     if adopt:
