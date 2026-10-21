@@ -371,7 +371,8 @@ def validate_config(cfg):
 
 
 def run(cmd, cwd=None, env=None, check=True, input_text=None):
-    p = subprocess.run(cmd, cwd=cwd, env=env, input=input_text, capture_output=True, text=True, encoding="utf-8")
+    p = subprocess.run(cmd, cwd=cwd, env=env, input=input_text, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
     if check and p.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed: {p.stderr.strip()[:400]}")
     return p.stdout
