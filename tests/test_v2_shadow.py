@@ -37,7 +37,7 @@ class ShadowRepoTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
-        env = patch.dict(os.environ, {"HOME": str(self.tmp / "home"), "BATON_HOME": str(self.tmp / "state")})
+        env = patch.dict(os.environ, {"HOME": str(self.tmp / "home"), "USERPROFILE": str(self.tmp / "home"), "BATON_HOME": str(self.tmp / "state")})
         env.start()
         self.addCleanup(env.stop)
 
@@ -202,7 +202,7 @@ class ProjectMarkerTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
-        env = patch.dict(os.environ, {"HOME": str(self.tmp / "home"), "BATON_HOME": str(self.tmp / "state")})
+        env = patch.dict(os.environ, {"HOME": str(self.tmp / "home"), "USERPROFILE": str(self.tmp / "home"), "BATON_HOME": str(self.tmp / "state")})
         env.start()
         self.addCleanup(env.stop)
 

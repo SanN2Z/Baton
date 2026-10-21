@@ -1,3 +1,5 @@
+from platform_fixtures import wait_windows_pid
+from platform_fixtures import executable_fixture
 import contextlib
 import io
 import json
@@ -17,6 +19,8 @@ import baton  # noqa: E402
 
 
 def wait_for_pid(pid, timeout=30):
+    if os.name == "nt":
+        return wait_windows_pid(pid, timeout)
     if not pid:
         return
     deadline = baton.now() + timeout
@@ -50,7 +54,7 @@ class RulingTests(unittest.TestCase):
         self.root = base / "project"
         self.root.mkdir()
         (self.root / "a.py").write_text("x = 1\n", encoding="utf-8")
-        self.env = patch.dict(os.environ, {"HOME": str(base / "home"), "BATON_HOME": str(base / "state"),
+        self.env = patch.dict(os.environ, {"HOME": str(base / "home"), "USERPROFILE": str(base / "home"), "BATON_HOME": str(base / "state"),
                                            "BATON_DESKTOP_NOTIFY": "0", "PYTHONDONTWRITEBYTECODE": "1"}, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -336,6 +340,7 @@ class RulingTests(unittest.TestCase):
     def test_close_success_lists_rejected_findings_and_closed_blocks_resume(self):
         finding = {"id": "F1", "category": "out_of_scope", "severity": "blocking", "description": "d",
                    "evidence": [], "rule_source": "r"}
+        report, _, _, _ = self.make_dossier(kind="report")
         dossier, _, _, _ = self.make_dossier(kind="final", findings=[finding])
         self.rule(dossier, "ACCEPT", {"F1": {"decision": "reject", "reason": "保留记录"}})
         self.project.update_state("t", lambda s: baton.current_leg(s).update(
@@ -345,6 +350,14 @@ class RulingTests(unittest.TestCase):
             baton.cmd_close(self.project, Namespace(task="t"))
         self.assertIn("已 closed", output.getvalue())
         self.assertIn("F1 · out_of_scope · blocking", output.getvalue())
+        root = Path(baton.dossier_path(self.project, dossier))
+        self.assertFalse((root / "code").exists())
+        self.assertFalse((Path(baton.dossier_path(self.project, report)) / "code").exists())
+        self.assertTrue((root / "charter.md").exists())
+        self.assertTrue(baton.verify_dossier(self.project, dossier)[0])
+        self.assertTrue(baton.verify_ledger(self.project))
+        brief, _ = baton._dossier_brief(self.project, "t", dossier)
+        self.assertIsNotNone(brief)
         with self.assertRaises(SystemExit):
             baton.cmd_resume(self.project, Namespace(task="t", message="x", message_file=None, kind="回复",
                                                      verdict=None, decision=None, user_approved_continue=False,
@@ -356,7 +369,7 @@ class RulingTests(unittest.TestCase):
         cli_root.mkdir()
         subprocess.run(["git", "init", "-q", str(cli_root)], check=True)
         env = os.environ.copy()
-        env.update({"HOME": str(Path(self.tmp.name) / "cli-home"),
+        env.update({"HOME": str(Path(self.tmp.name) / "cli-home"), "USERPROFILE": str(Path(self.tmp.name) / "cli-home"),
                     "BATON_HOME": str(Path(self.tmp.name) / "cli-state"),
                     "BATON_DESKTOP_NOTIFY": "0"})
         bindir = Path(self.tmp.name) / "cli-bin"
@@ -384,7 +397,7 @@ else:
         value = {'status':'done','summary':'done','artifact':'','change_size':'minor'}
     pathlib.Path(out).write_text(json.dumps(value, ensure_ascii=False))
 """, encoding="utf-8")
-        fake.chmod(0o755)
+        fake = executable_fixture(fake)
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
         def run(*args):
             return subprocess.run([sys.executable, str(ROOT / "skills/baton/scripts/baton.py"), "--root", str(cli_root), *args],
