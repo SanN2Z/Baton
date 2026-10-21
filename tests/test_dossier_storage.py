@@ -96,6 +96,21 @@ class DossierStorageTests(unittest.TestCase):
         self.assertEqual((self.root / ".git" / "index").read_bytes(), git_index)
         self.assertEqual(store.git("show", ref + ":evidence/raw.bin"), "x" * 4096)
 
+    @unittest.skipUnless(os.name == "nt", "Windows ACL behaviour")
+    def test_dossier_code_directories_keep_inherited_acl(self):
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        store = self.project.store("t")
+        ref = store.snapshot("subdirectory")
+        # TemporaryDirectory is itself owner-only on Windows; use a parent with an ordinary ACL.
+        parent = Path(tempfile.gettempdir()) / f"baton-acl-{os.getpid()}-{id(self)}"
+        self.addCleanup(shutil.rmtree, parent, True)
+        target = parent / "copy"
+        baton._dossier_code_snapshot(store, ref, str(target))
+        acl = subprocess.run(["icacls", str(target / "pkg")], capture_output=True, text=True,
+                             encoding="mbcs").stdout
+        self.assertIn("(I)", acl)
+
     def test_non_git_dossier_keeps_ignored_files(self):
         shutil.rmtree(self.root / ".git")
         (self.root / "evidence").mkdir()

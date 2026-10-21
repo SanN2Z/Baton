@@ -830,6 +830,11 @@ def _dossier_code_snapshot(store, ref, target):
                 destination = os.path.realpath(os.path.join(target, name))
                 if destination != os.path.realpath(target) and not destination.startswith(os.path.realpath(target) + os.sep):
                     continue
+                if member.isdir():
+                    # tarfile creates directories with mode 0o700, which on Windows (Python 3.12.4+) becomes an
+                    # owner-only ACL that the monitor's sandbox cannot read; makedirs keeps the inherited ACL.
+                    os.makedirs(destination, exist_ok=True)
+                    continue
                 archive.extract(member, target)
     finally:
         try:
