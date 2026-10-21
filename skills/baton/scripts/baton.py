@@ -929,17 +929,20 @@ def _prune_dossier_code(project, dossier_id, reason, dry_run=False):
              for directory, _, names in os.walk(code) for name in names]
     removed = {"files": len(sizes), "bytes": sum(sizes), "reason": reason, "at": now()}
     if not dry_run:
-        manifest = dossier_manifest(project, dossier_id)
-        if not manifest.get("files"):
+        incomplete = not os.path.exists(os.path.join(root, "manifest.json"))
+        manifest = {} if incomplete else dossier_manifest(project, dossier_id)
+        if not incomplete and not manifest.get("files"):
             raise RuntimeError("卷宗缺少文件清单，不能清理：" + dossier_id)
         os.chmod(root, 0o755)
         try:
             _unseal_dossier(code)
             shutil.rmtree(code)
-            # Keep the original inventory/hash so existing ledger bindings still resolve.
-            manifest["code_pruned"] = removed
-            os.chmod(os.path.join(root, "manifest.json"), 0o644)
-            write_json(os.path.join(root, "manifest.json"), manifest)
+            # An interrupted build has no manifest and nothing bound to it in the ledger; otherwise
+            # keep the original inventory/hash so existing ledger bindings still resolve.
+            if not incomplete:
+                manifest["code_pruned"] = removed
+                os.chmod(os.path.join(root, "manifest.json"), 0o644)
+                write_json(os.path.join(root, "manifest.json"), manifest)
         finally:
             _seal_dossier(root)
     return removed

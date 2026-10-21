@@ -224,6 +224,17 @@ class DossierStorageTests(unittest.TestCase):
             baton.cmd_gc(self.project, argparse.Namespace(dry_run=False))
         self.assertIn("已清理 0 份卷宗代码", output.getvalue())
 
+    def test_gc_prunes_interrupted_dossier_without_manifest(self):
+        ident = self.build(kind="check")
+        root = self.dossier(ident)
+        baton._unseal_dossier(str(root))
+        (root / "manifest.json").unlink()
+        self.project.update_state("t", lambda s: s.update(status="closed"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            baton.cmd_gc(self.project, argparse.Namespace(dry_run=False))
+        self.assertFalse((root / "code").exists())
+        self.assertFalse((root / "manifest.json").exists())
+
     def test_gc_recognizes_old_report_ownership_from_ledger_and_state(self):
         reports = []
         for n in (1, 2):
