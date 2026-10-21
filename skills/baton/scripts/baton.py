@@ -5428,7 +5428,7 @@ def _memory_keyword_fallback(project, task, prompt, st, cfg, reason):
     prior = (st or {}).get("legs") or []
     if prior:
         diff_items = (prior[-1].get("diff") or []) if isinstance(prior[-1], dict) else []
-        queries.extend(str(item.get("path")) for item in diff_items)
+        queries.extend(str(item.get("path")) for item in diff_items if isinstance(item, dict) and item.get("path"))
     previous_ids = [str(item) for leg in (st or {}).get("legs", []) for item in (leg.get("memory_pushed") or [])]
     latest = ledger.latest()
     withdrawals = []
@@ -5464,7 +5464,7 @@ def memory_prompt_for_leg(project, task, prompt, st=None, cfg=None):
     prior = (st or {}).get("legs") or []
     if prior:
         diff_items = (prior[-1].get("diff") or []) if isinstance(prior[-1], dict) else []
-        queries.extend(str(item.get("path")) for item in diff_items)
+        queries.extend(str(item.get("path")) for item in diff_items if isinstance(item, dict) and item.get("path"))
     payload = {"project_root": project.root, "baton_home": memory_baton_home(cfg), "queries": queries,
                "previous_ids": [str(item) for leg in (st or {}).get("legs", []) for item in (leg.get("memory_pushed") or [])],
                "memory": cfg.get("memory", {})}

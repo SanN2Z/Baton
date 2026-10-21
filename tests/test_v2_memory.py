@@ -132,6 +132,18 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("FAKE_VENV_CONTEXT", text)
         self.assertEqual(meta["pushed"], ["M001"])
 
+    def test_keyword_fallback_accepts_shortstat_diff_from_prior_leg(self):
+        # A finished leg stores diff as the [files, insertions, deletions] shortstat, not path records.
+        import baton
+        (self.root / ".baton" / "tasks" / "task").mkdir(parents=True, exist_ok=True)
+        (self.root / ".baton" / "tasks" / "task" / "brief.md").write_text("目标\n", encoding="utf-8")
+        self.ledger.append([self.entry()])
+        project = baton.Project(str(self.root))
+        st = {"legs": [{"n": 1, "diff": [4, 195, 96]}]}
+        cfg = baton.deep_merge(project.config, {"memory": {"backend": "local"}})
+        text, meta = baton.memory_prompt_for_leg(project, "task", "指令", st=st, cfg=cfg)
+        self.assertIn("指令", text)
+
     def test_profile_config_passes_baton_home_to_mcp(self):
         import baton
         fake = Path(baton.platform_support.venv_python(str(self.home)))
