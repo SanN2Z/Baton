@@ -7908,7 +7908,10 @@ def cmd_status(project, args):
     print(f"任务状态：{st.get('status')}；Codex 会话：{st.get('thread_id') or '未知'}；共 {len(st.get('legs', []))} 轮")
     if st.get("status") == "closed":
         closed = st.get("closed") or {}
-        print(f"任务已 closed：终审 {closed.get('dossier') or '未知'}，账本 seq {closed.get('ledger_seq') or '未知'}")
+        if closed.get("abandoned"):
+            print(f"任务已按放弃 closed（未终审）：{closed.get('reason')}，账本 seq {closed.get('ledger_seq') or '未知'}")
+        else:
+            print(f"任务已 closed：终审 {closed.get('dossier') or '未知'}，账本 seq {closed.get('ledger_seq') or '未知'}")
     revision_counts = _revision_counts(project, task)
     if revision_counts:
         print("REVISE 累计：" + "，".join(f"{k}={v}" for k, v in sorted(revision_counts.items())))
@@ -8136,6 +8139,16 @@ def cmd_close(project, args):
                 (leg.get("n"), leg.get("status"), json.dumps(monitor_value, ensure_ascii=False)))
     if not verify_ledger(project):
         die("账本校验失败，不能 close")
+    reason = getattr(args, "abandon", None)
+    if reason is not None:
+        if not reason.strip():
+            die("--abandon 需要写明放弃原因")
+        record = append_ledger(project, {"type": "abandon", "task": task, "reason": reason.strip()})
+        project.update_state(task, lambda s: s.update(status="closed", closed={"abandoned": True,
+            "reason": reason.strip(), "ledger_seq": record.get("seq"), "at": now()}))
+        prune_closed_task(project, task)
+        print(f"任务 {task} 已按放弃 closed（未终审，账本 seq {record.get('seq')}）：{reason.strip()}")
+        return
     dossiers = _final_dossiers(project, task)
     if not dossiers:
         die("没有终审卷宗，不能 close")
@@ -9191,6 +9204,8 @@ def main():
     s.add_argument("task")
     s = sub.add_parser("close", help="验收通过后关闭任务")
     s.add_argument("task")
+    s.add_argument("--abandon", metavar="REASON",
+                   help="没有 ACCEPT 终审也关闭（如以 REPORT 结束的任务），写入账本并清理卷宗代码")
     s = sub.add_parser("gc", help="清理已 closed 任务的卷宗代码，保留记录和账本")
     s.add_argument("--dry-run", action="store_true", help="只列出将清理的卷宗、文件数和字节数")
     s = sub.add_parser("supervised", help="记录一次监管结论并重置计时")
