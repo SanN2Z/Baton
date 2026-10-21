@@ -47,6 +47,21 @@ class FreezeTests(unittest.TestCase):
         self.st = {"scope": self.scope, "freeze_manifest": manifest}
         return manifest
 
+    def test_bytecode_and_binary_files_under_tested_folder_do_not_break_freeze(self):
+        self.write("tests/acceptance/test_a.py", "def test_a():\n    assert True\n")
+        cache = self.root / "tests" / "acceptance" / "__pycache__"
+        cache.mkdir()
+        (cache / "test_a.cpython-312.pyc").write_bytes(b"\x9c\x00\xff\xfe bytecode")
+        (self.root / "tests" / "acceptance" / "fixture.bin").write_bytes(b"\x9c\xff\x00")
+        manifest = self.baseline()
+        paths = {entry["path"]: entry for entry in manifest["entries"]}
+        self.assertNotIn("tests/acceptance/__pycache__/test_a.cpython-312.pyc", paths)
+        self.assertTrue(paths["tests/acceptance/fixture.bin"]["value"].startswith("sha256:"))
+        (cache / "test_a.cpython-312.pyc").write_bytes(b"\x9c rebuilt by a test run")
+        self.assertEqual(baton.check_freeze(self.project, "t", self.st)["violations"], [])
+        (self.root / "tests" / "acceptance" / "fixture.bin").write_bytes(b"\x9c\xff\x01")
+        self.assertEqual(baton.check_freeze(self.project, "t", self.st)["violations"][0]["type"], "改动")
+
     def test_scope_valid_missing_invalid_unknown_and_escape(self):
         valid = "```baton-scope\n" + json.dumps({"allow": [], "deny": [], "acceptance": [], "frozen": []}) + "\n```"
         self.assertEqual(baton.parse_scope(valid)["verify"], "auto")
