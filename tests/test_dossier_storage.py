@@ -250,6 +250,24 @@ class DossierStorageTests(unittest.TestCase):
         self.assertFalse((root / "code").exists())
         self.assertFalse((root / "manifest.json").exists())
 
+    def test_prune_retries_transient_directory_not_empty(self):
+        ident = self.build(kind="check")
+        root = self.dossier(ident)
+        real_rmtree = shutil.rmtree
+        calls = []
+
+        def flaky(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError(145, "directory not empty")
+            return real_rmtree(path, *args, **kwargs)
+
+        with patch.object(baton.shutil, "rmtree", flaky), patch.object(baton.time, "sleep"):
+            removed = baton._prune_dossier_code(self.project, ident, "closed")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(removed["files"] > 0)
+        self.assertFalse((root / "code").exists())
+
     def test_gc_recognizes_old_report_ownership_from_ledger_and_state(self):
         reports = []
         for n in (1, 2):

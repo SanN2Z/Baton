@@ -931,6 +931,21 @@ def _unseal_dossier(root):
             pass
 
 
+def _rmtree_retry(path, attempts=5, delay=0.5):
+    # On Windows a file still held open (scanner, indexer, a just-exited monitor) is only marked for deletion,
+    # so removing its directory can fail with "directory not empty" (WinError 145) until the handle closes.
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _prune_dossier_code(project, dossier_id, reason, dry_run=False):
     root = dossier_path(project, dossier_id)
     code = os.path.join(root, "code")
@@ -949,7 +964,7 @@ def _prune_dossier_code(project, dossier_id, reason, dry_run=False):
         os.chmod(root, 0o755)
         try:
             _unseal_dossier(code)
-            shutil.rmtree(code)
+            _rmtree_retry(code)
             # An interrupted build has no manifest and nothing bound to it in the ledger; otherwise
             # keep the original inventory/hash so existing ledger bindings still resolve.
             if not incomplete:
