@@ -111,6 +111,21 @@ class DossierStorageTests(unittest.TestCase):
                              encoding="mbcs").stdout
         self.assertIn("(I)", acl)
 
+    @unittest.skipUnless(os.name == "nt", "Windows MAX_PATH behaviour")
+    def test_dossier_snapshot_records_paths_beyond_max_path(self):
+        (self.root / "keep.py").write_text("x = 1\n", encoding="utf-8")
+        (self.root / "deep").mkdir()
+        (self.root / "deep" / ("f" * 120 + ".txt")).write_text("tmp\n", encoding="utf-8")
+        store = self.project.store("t")
+        ref = store.snapshot("long path")
+        parent = Path(tempfile.gettempdir()) / f"baton-long-{os.getpid()}-{id(self)}"
+        self.addCleanup(shutil.rmtree, parent, True)
+        target = parent / ("d" * max(1, 200 - len(str(parent))))
+        omissions = baton._dossier_code_snapshot(store, ref, str(target))
+        self.assertTrue((target / "keep.py").is_file())
+        self.assertEqual(omissions["long_paths"]["files"], 1)
+        self.assertEqual(omissions["long_paths"]["examples"], ["deep/" + "f" * 120 + ".txt"])
+
     def test_non_git_dossier_keeps_ignored_files(self):
         shutil.rmtree(self.root / ".git")
         (self.root / "evidence").mkdir()

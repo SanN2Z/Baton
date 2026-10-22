@@ -791,6 +791,10 @@ def _dossier_write(path, text, binary=False):
             stream.write(text)
 
 
+_WIN_MAX_PATH = 260  # MAX_PATH incl. the terminating NUL
+_WIN_MAX_DIR = 248   # CreateDirectory leaves room for an 8.3 file name
+
+
 def _dossier_code_snapshot(store, ref, target):
     omissions = {"files": 0, "bytes": 0, "reason": "项目 git ignore 规则忽略的未跟踪文件"}
     os.makedirs(target, exist_ok=True)
@@ -829,6 +833,15 @@ def _dossier_code_snapshot(store, ref, target):
                     continue
                 destination = os.path.realpath(os.path.join(target, name))
                 if destination != os.path.realpath(target) and not destination.startswith(os.path.realpath(target) + os.sep):
+                    continue
+                if os.name == "nt" and len(destination) >= (_WIN_MAX_DIR if member.isdir() else _WIN_MAX_PATH):
+                    # Without LongPathsEnabled the copy cannot be created (e.g. deep pytest basetemp dirs).
+                    if not member.isdir():
+                        long_paths = omissions.setdefault("long_paths", {"files": 0, "bytes": 0, "examples": []})
+                        long_paths["files"] += 1
+                        long_paths["bytes"] += member.size
+                        if len(long_paths["examples"]) < 5:
+                            long_paths["examples"].append(name)
                     continue
                 if member.isdir():
                     # tarfile creates directories with mode 0o700, which on Windows (Python 3.12.4+) becomes an
